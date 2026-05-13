@@ -53,9 +53,11 @@ The core calculation flows through three layers:
 
 ### Data Models (`core/models.py`)
 
-Key dataclasses: `TrussType`, `LoadTableEntry`, `TrussSection`, `Support`, `PointLoad`, `DistributedLoad`, `Project`, `CalculationResult`, `SupportResult`, `DeflectionResult`.
+Key dataclasses: `TrussType`, `LoadTableEntry`, `TrussSection`, `Support`, `PointLoad`, `DistributedLoad`, `Project`, `ProjectBundle`, `CalculationResult`, `SupportResult`, `DeflectionResult`.
 
 `Project.total_length_m` is a computed property (sum of section lengths). `Support.has_max_force` guards utilization calculations.
+
+`ProjectBundle` is the current multi-tab project container. Each `Project` inside `ProjectBundle.subprojects` is one independent Sub-Projekt with its own truss type, geometry, loads, undo/redo stack, and calculation result. Treat the active tab as a sub-project editor; do not reintroduce global single-project assumptions in UI, persistence, or PDF code.
 
 ### Database (`database/db_manager.py`)
 
@@ -63,7 +65,7 @@ SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCA
 
 ### UI (`ui/`)
 
-- **`main_window.py`**: LTSpice-style layout — library panel (left), `TrussCanvas` (center), properties panel (right). Calculation is triggered via F5 / toolbar button. `_generate_pdf()` shows `ReportMetadataDialog` first, then `QFileDialog`, then calls `pdf_generator.generate_report()`.
+- **`main_window.py`**: LTSpice-style layout — library panel (left), `QTabWidget` + `TrussCanvas` (center), properties panel (right). Calculation is triggered via F5 / toolbar button and belongs only to the active Sub-Projekt. `_generate_pdf()` exports all calculated Sub-Projekte through `pdf_generator.generate_project_report()`; `generate_report()` remains the public single-report compatibility API. The PDF metadata dialog asks for project-level metadata only; Sub-Projekt names come from the tab names.
 - **`canvas/truss_canvas.py`**: `QGraphicsView` with tool states (`CanvasTool` enum). Click handlers emit signals that open dialogs.
 - **`canvas/canvas_items.py`**: `QGraphicsItem` subclasses for truss sections, supports, loads. Colors come from `core/color_rules.py` after calculation.
 
@@ -72,6 +74,21 @@ SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCA
 - **`pdf_generator.py`**: ReportLab `BaseDocTemplate` with two frames (header-bleed frame for page 1, normal frame for subsequent pages). Uses `_NumberedCanvas` for footer/page numbers. Logo is loaded from `resources/logo_noisegate.pdf`, rendered at 150 DPI via PyMuPDF, then black→white inverted via PIL (black ink on white → white on dark header). Datasheet PDF pages are appended via PyMuPDF after ReportLab build.
 - **`pdf/i18n.py`**: DE/EN string table, accessed via `tr(lang, key, **kwargs)`. All user-visible strings in reports must go through `tr()`.
 - **`ui/dialogs/report_metadata_dialog.py`**: `ReportMetadataDialog` asks for language, project name, sub-project name, and creator email before PDF generation. Persists email + language in `QSettings("NoiseGate", "TrussCalc")`.
+
+### Project Persistence
+
+- `.tcproj` files are format version `2` and contain a top-level `ProjectBundle` with `data.subprojects[]`.
+- Legacy files without `subprojects` are automatically migrated to one Sub-Projekt by `load_project_from_file()`.
+- Always call `_commit_active_subproject_state()` before saving, exporting PDF, or switching away from the active tab.
+- `save_project()` / `load_project()` in `database/db_manager.py` use the same JSON structure as `.tcproj`.
+
+### Copy / Mirror Interaction
+
+- `Ctrl+C` immediately starts copy mode for the current selection.
+- `Ctrl+V` restarts placement using the stored copy template.
+- Right-click and `Esc` cancel only the active placement preview; the stored copy template remains available.
+- `Ctrl+M` copies and mirrors the current selection around the active Sub-Projekt's total truss length.
+- Sub-Projekt tabs are movable by drag & drop. When handling tab order, reorder `ProjectBundle.subprojects` and all parallel arrays (`_subproject_truss_types`, `_subproject_results`, `_subproject_undo_stacks`, `_subproject_redo_stacks`) together.
 
 ### Color Rules (`core/color_rules.py`)
 
@@ -116,6 +133,7 @@ The report must keep DE/EN support through `trusscalc/pdf/i18n.py`; all user-vis
 - Render the NoiseGate logo as white artwork on the dark header without a white background box.
 - Keep page 1 focused on: dark header, metadata row, support/deflection cards, and the static-system drawing in a light framed card.
 - Keep page 2 focused on: support reactions table, deflection analysis, field cards, bill of materials, important notice, and signature areas.
+- Multi-Sub-Projekt PDFs should place all Sub-Projekt chapters first, then a final combined bill-of-materials page with Sub-Projekt names, notice, and signature fields, and only then append datasheets.
 - Preserve datasheet appending with PyMuPDF by saving to a temporary `.tmp` file and replacing the final path via `os.replace()`.
 - Keep ReportLab styles namespaced or locally managed to avoid collisions with default style aliases.
 

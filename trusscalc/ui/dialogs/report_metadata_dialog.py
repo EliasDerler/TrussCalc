@@ -17,7 +17,7 @@ class ReportMetadata:
 
 
 class ReportMetadataDialog(QDialog):
-    """Fragt Sprache, Projektnamen, Sub-Projektnamen und Ersteller-E-Mail ab."""
+    """Fragt Sprache, Projektnamen und Ersteller-E-Mail ab."""
 
     SETTINGS_KEY_EMAIL = "report/creator_email"
     SETTINGS_KEY_LANG = "report/language"
@@ -27,7 +27,7 @@ class ReportMetadataDialog(QDialog):
                  parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("PDF-Report erstellen")
-        self.resize(480, 260)
+        self.resize(480, 220)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -46,10 +46,6 @@ class ReportMetadataDialog(QDialog):
         self._project_edit.setPlaceholderText("z. B. Projekt – EuroTruss XD")
         form.addRow("Projektname:", self._project_edit)
 
-        self._subname_edit = QLineEdit()
-        self._subname_edit.setPlaceholderText("z. B. Hauptbühne – Front Truss")
-        form.addRow("Sub-Projektname:", self._subname_edit)
-
         self._email_edit = QLineEdit()
         self._email_edit.setPlaceholderText("name@firma.at")
         form.addRow("Ersteller-E-Mail:", self._email_edit)
@@ -66,7 +62,6 @@ class ReportMetadataDialog(QDialog):
             self._lang_combo.setCurrentIndex(idx)
 
         self._project_edit.setText(default_project_name)
-        self._subname_edit.setText(default_sub_name)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -90,6 +85,6 @@ class ReportMetadataDialog(QDialog):
         return ReportMetadata(
             language=self._lang_combo.currentData(),
             project_name=self._project_edit.text().strip(),
-            sub_project_name=self._subname_edit.text().strip(),
+            sub_project_name="",
             creator_email=self._email_edit.text().strip(),
         )

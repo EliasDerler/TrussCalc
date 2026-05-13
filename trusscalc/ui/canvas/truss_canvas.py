@@ -360,6 +360,12 @@ class TrussCanvas(QGraphicsView):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         mods = event.modifiers()
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Escape:
+            if self._copy_mode:
+                self.cancel_copy_mode()
+                self.copy_cancel_requested.emit()
+                event.accept()
+                return
         if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_C:
             self.copy_requested.emit()
             event.accept()
@@ -439,6 +445,9 @@ class TrussCanvas(QGraphicsView):
         self._copy_mode = True
         self.setCursor(Qt.CursorShape.CrossCursor)
         self._update_copy_preview(self._copy_anchor_m)
+
+    def is_copy_mode_active(self) -> bool:
+        return self._copy_mode
 
     def cancel_copy_mode(self) -> None:
         self._copy_mode = False

@@ -6,7 +6,10 @@ nummerierten Sektionen, Hinweisbox und Signaturen. Sprache DE/EN umschaltbar.
 from __future__ import annotations
 
 import datetime
+import os
+import tempfile
 from collections import Counter
+from dataclasses import replace
 from typing import Optional
 
 from reportlab.lib.pagesizes import A4
@@ -121,6 +124,8 @@ def generate_report(
     result: CalculationResult,
     datasheet_pdf_bytes: Optional[bytes] = None,
     metadata=None,
+    include_partlist: bool = True,
+    include_notice_signature: bool = True,
 ) -> None:
     """Erzeugt den PDF-Report. ``metadata`` ist ein ReportMetadata-Dataclass."""
     path = str(path)
@@ -205,19 +210,21 @@ def generate_report(
         story.append(_field_cards(fields, result, lang, styles))
         story.append(Spacer(1, 0.5 * cm))
 
-    # 4) Stückliste
-    story.append(_section_header(4, tr(lang, "section_partlist"),
-                                  tr(lang, "section_partlist_sub"), styles))
-    story.append(Spacer(1, 0.2 * cm))
-    story.append(_partlist_table(project, truss_type, lang, styles))
-    story.append(Spacer(1, 0.6 * cm))
+    if include_partlist:
+        # 4) Stückliste
+        story.append(_section_header(4, tr(lang, "section_partlist"),
+                                      tr(lang, "section_partlist_sub"), styles))
+        story.append(Spacer(1, 0.2 * cm))
+        story.append(_partlist_table(project, truss_type, lang, styles))
+        story.append(Spacer(1, 0.6 * cm))
 
-    # Wichtiger Hinweis
-    story.append(_notice_box(lang, styles))
-    story.append(Spacer(1, 0.5 * cm))
+    if include_notice_signature:
+        # Wichtiger Hinweis
+        story.append(_notice_box(lang, styles))
+        story.append(Spacer(1, 0.5 * cm))
 
-    # Signaturen
-    story.append(_signature_block(lang, styles))
+        # Signaturen
+        story.append(_signature_block(lang, styles))
 
     # Footer-Drawer benötigt Daten → Closure
     footer = _make_footer_drawer(metadata, lang)
@@ -228,6 +235,98 @@ def generate_report(
     # Datenblatt anhängen
     if datasheet_pdf_bytes:
         _append_datasheet(path, datasheet_pdf_bytes)
+
+
+def generate_project_report(path: str, chapters: list[dict], metadata=None) -> None:
+    """Erzeugt ein Gesamt-PDF aus mehreren Sub-Projekt-Reports.
+
+    ``generate_report`` bleibt die Einzelreport-Schnittstelle. Diese Funktion
+    baut je Sub-Projekt einen normalen Report und führt die Kapitel anschließend
+    in der gewünschten Reihenfolge zusammen.
+    """
+    if not chapters:
+        raise ValueError("Keine berechneten Sub-Projekte für den PDF-Report vorhanden.")
+
+    if metadata is None:
+        from trusscalc.ui.dialogs.report_metadata_dialog import ReportMetadata
+        first_project = chapters[0]["project"]
+        metadata = ReportMetadata(
+            language="de",
+            project_name=first_project.name or "Projekt",
+            sub_project_name="",
+            creator_email="info@noisegate.at",
+        )
+
+    path = str(path)
+    target_tmp = path + ".tmp"
+    try:
+        import pymupdf
+
+        with tempfile.TemporaryDirectory(prefix="trusscalc_pdf_") as tmp_dir:
+            chapter_paths = []
+            multi = len(chapters) > 1
+            for idx, chapter in enumerate(chapters, start=1):
+                project = chapter["project"]
+                sub_name = project.name or f"Sub-Projekt {idx}"
+                if not multi and metadata.sub_project_name:
+                    sub_name = metadata.sub_project_name
+                chapter_meta = replace(
+                    metadata,
+                    sub_project_name=sub_name,
+                )
+                chapter_path = os.path.join(tmp_dir, f"chapter_{idx:03d}.pdf")
+                generate_report(
+                    path=chapter_path,
+                    project=project,
+                    truss_type=chapter["truss_type"],
+                    result=chapter["result"],
+                    datasheet_pdf_bytes=None,
+                    metadata=chapter_meta,
+                    include_partlist=not multi,
+                    include_notice_signature=not multi,
+                )
+                chapter_paths.append(chapter_path)
+            if multi:
+                closing_path = os.path.join(tmp_dir, "closing.pdf")
+                _build_project_closing_pdf(closing_path, chapters, metadata)
+                chapter_paths.append(closing_path)
+
+            merged = pymupdf.open()
+            try:
+                for chapter_path in chapter_paths:
+                    chapter_doc = pymupdf.open(chapter_path)
+                    try:
+                        merged.insert_pdf(chapter_doc)
+                    finally:
+                        chapter_doc.close()
+                appended_datasheets = set()
+                for chapter in chapters:
+                    datasheet_bytes = chapter.get("datasheet_pdf_bytes")
+                    if not datasheet_bytes:
+                        continue
+                    key = (
+                        getattr(chapter.get("truss_type"), "id", None),
+                        len(datasheet_bytes),
+                    )
+                    if key in appended_datasheets:
+                        continue
+                    appended_datasheets.add(key)
+                    datasheet_doc = pymupdf.open(stream=datasheet_bytes, filetype="pdf")
+                    try:
+                        merged.insert_pdf(datasheet_doc)
+                    finally:
+                        datasheet_doc.close()
+                merged.save(target_tmp)
+            finally:
+                merged.close()
+        os.replace(target_tmp, path)
+    except Exception:
+        if os.path.exists(target_tmp):
+            try:
+                os.remove(target_tmp)
+            except OSError:
+                pass
+        raise
 
 
 # ── Styles ─────────────────────────────────────────────────────────────────
@@ -1355,6 +1454,104 @@ def _partlist_table(project: Project, truss_type: TrussType, lang: str,
 
 
 # ── Hinweis-Box ────────────────────────────────────────────────────────────
+
+def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> Table:
+    head = [
+        tr(lang, "col_subproject"),
+        tr(lang, "col_truss_type"),
+        tr(lang, "col_length"),
+        tr(lang, "col_pieces"),
+    ]
+    rows = [head]
+    for idx, chapter in enumerate(chapters, start=1):
+        project = chapter["project"]
+        truss_type = chapter["truss_type"]
+        sub_name = project.name or f"Sub-Projekt {idx}"
+        lengths = Counter(round(s.length_m, 2) for s in project.sections)
+        for length, count in sorted(lengths.items()):
+            rows.append([
+                sub_name,
+                truss_type.display_name,
+                f"{length * 100:.0f} cm",
+                str(count),
+            ])
+        for support_idx, support in enumerate(
+            sorted(project.supports, key=lambda s: s.position_m), start=1
+        ):
+            force = (
+                f"{support.max_force_kg:.0f} kg"
+                if support.has_max_force else tr(lang, "partlist_unlimited")
+            )
+            rows.append([
+                sub_name,
+                tr(lang, "partlist_support", n=support_idx),
+                f"{support.position_m * 100:.0f} cm, "
+                f"{tr(lang, 'partlist_max_force', force=force)}",
+                "1",
+            ])
+
+    inner_w = PAGE_W - 2 * MARGIN
+    col_w = [inner_w * 0.25, inner_w * 0.38, inner_w * 0.22, inner_w * 0.15]
+    tbl = Table(rows, colWidths=col_w, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEAD_BG),
+        ("TEXTCOLOR", (0, 0), (-1, 0), TEXT_MUTED),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 7.5),
+        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 1), (-1, -1), 8.5),
+        ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (2, 0), (3, -1), "RIGHT"),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.4, CARD_BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    for row_idx in range(1, len(rows)):
+        if row_idx % 2 == 0:
+            style.append(("BACKGROUND", (0, row_idx), (-1, row_idx), TABLE_ROW_ALT))
+    tbl.setStyle(TableStyle(style))
+    return tbl
+
+
+def _build_project_closing_pdf(path: str, chapters: list[dict], metadata) -> None:
+    lang = metadata.language
+    styles = _styles(lang)
+    doc = BaseDocTemplate(
+        path, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN,
+        topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+        title=metadata.project_name,
+        author=metadata.creator_email or "TrussCalc",
+    )
+    frame = Frame(
+        MARGIN, 1.5 * cm,
+        PAGE_W - 2 * MARGIN, PAGE_H - 3.0 * cm,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+        id="closing",
+    )
+    doc.addPageTemplates([PageTemplate(id="closing", frames=frame)])
+
+    story = [
+        _section_header(
+            4,
+            tr(lang, "section_combined_partlist"),
+            tr(lang, "section_combined_partlist_sub"),
+            styles,
+        ),
+        Spacer(1, 0.25 * cm),
+        _combined_partlist_table(chapters, lang, styles),
+        Spacer(1, 0.6 * cm),
+        _notice_box(lang, styles),
+        Spacer(1, 0.5 * cm),
+        _signature_block(lang, styles),
+    ]
+    footer = _make_footer_drawer(metadata, lang)
+    doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
+        *a, footer_drawer=footer, **kw))
+
 
 def _notice_box(lang: str, styles: dict) -> Flowable:
     return _NoticeBox(

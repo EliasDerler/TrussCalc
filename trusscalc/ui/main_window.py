@@ -12,12 +12,13 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QFileDialog, QInputDialog, QLabel,
     QComboBox, QSplitter, QDialog, QApplication, QProgressDialog,
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
+    QPushButton, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QIcon
 
 from trusscalc.core.models import (
-    Project, TrussType, TrussSection, Support, PointLoad, DistributedLoad,
+    Project, ProjectBundle, TrussType, TrussSection, Support, PointLoad, DistributedLoad,
     UnitSystem, CalculationResult,
 )
 from trusscalc.core import calculator
@@ -37,11 +38,18 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("TrussCalc")
         self.resize(1280, 780)
+        self._project_bundle: Optional[ProjectBundle] = None
         self._project: Optional[Project] = None
         self._truss_type: Optional[TrussType] = None
         self._last_result: Optional[CalculationResult] = None
         self._undo_stack: list = []
         self._redo_stack: list = []
+        self._active_subproject_index = 0
+        self._subproject_truss_types: list[Optional[TrussType]] = []
+        self._subproject_results: list[Optional[CalculationResult]] = []
+        self._subproject_undo_stacks: list[list] = []
+        self._subproject_redo_stacks: list[list] = []
+        self._updating_tabs = False
         self._project_path: Optional[str] = None
         self._update_worker = None
         self._pdf_worker = None
@@ -112,7 +120,7 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda checked, t=tool: self._set_tool(t))
             return act
 
-        self._act_select = tool_action("▶ Auswahl", CanvasTool.SELECT, "Esc")
+        self._act_select = tool_action("▶ Auswahl", CanvasTool.SELECT)
         self._act_section = tool_action("━ Abschnitt", CanvasTool.ADD_SECTION, "T")
         self._act_support = tool_action("▽ Auflager", CanvasTool.ADD_SUPPORT, "A")
         self._act_point = tool_action("↓ Punktlast", CanvasTool.ADD_POINT_LOAD, "P")
@@ -173,8 +181,39 @@ class MainWindow(QMainWindow):
         self._props.edit_requested.connect(self._on_edit_element)
         self._props.delete_requested.connect(self._on_element_deleted)
 
+        self._tabs = QTabWidget()
+        self._tabs.setMovable(True)
+        self._tabs.setMaximumHeight(34)
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        self._tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+
+        tab_buttons = QHBoxLayout()
+        tab_buttons.setContentsMargins(0, 0, 0, 0)
+        self._btn_tab_new = QPushButton("Neu")
+        self._btn_tab_rename = QPushButton("Umbenennen")
+        self._btn_tab_duplicate = QPushButton("Duplizieren")
+        self._btn_tab_delete = QPushButton("Löschen")
+        self._btn_tab_new.clicked.connect(self._add_subproject_tab)
+        self._btn_tab_rename.clicked.connect(self._rename_subproject_tab)
+        self._btn_tab_duplicate.clicked.connect(self._duplicate_subproject_tab)
+        self._btn_tab_delete.clicked.connect(self._delete_subproject_tab)
+        for btn in (
+            self._btn_tab_new, self._btn_tab_rename,
+            self._btn_tab_duplicate, self._btn_tab_delete,
+        ):
+            tab_buttons.addWidget(btn)
+        tab_buttons.addStretch(1)
+
+        center = QWidget()
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(3)
+        center_layout.addWidget(self._tabs)
+        center_layout.addLayout(tab_buttons)
+        center_layout.addWidget(self._canvas, 1)
+
         splitter.addWidget(self._library)
-        splitter.addWidget(self._canvas)
+        splitter.addWidget(center)
         splitter.addWidget(self._props)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -211,31 +250,214 @@ class MainWindow(QMainWindow):
             CanvasTool.ADD_DIST_LOAD: "Klick auf Canvas: Streckenlast setzen",
         }[tool])
 
+    def _create_empty_subproject(self, name: str = "Sub-Projekt 1") -> Project:
+        unit = self._unit_combo.currentData() if hasattr(self, "_unit_combo") else UnitSystem.KG_M
+        return Project(name=name, truss_type_id=0, unit_system=unit)
+
+    def _load_project_bundle(self, bundle: ProjectBundle) -> None:
+        if not bundle.subprojects:
+            bundle.subprojects.append(self._create_empty_subproject())
+        self._project_bundle = bundle
+        self._subproject_truss_types = [None for _ in bundle.subprojects]
+        self._subproject_results = [None for _ in bundle.subprojects]
+        self._subproject_undo_stacks = [[] for _ in bundle.subprojects]
+        self._subproject_redo_stacks = [[] for _ in bundle.subprojects]
+        self._active_subproject_index = 0
+        self._refresh_tabs()
+        self._activate_subproject(0)
+
+    def _refresh_tabs(self) -> None:
+        self._updating_tabs = True
+        self._tabs.clear()
+        if self._project_bundle:
+            for project in self._project_bundle.subprojects:
+                self._tabs.addTab(QWidget(), project.name or "Sub-Projekt")
+            self._tabs.setCurrentIndex(self._active_subproject_index)
+        self._updating_tabs = False
+
+    def _commit_active_subproject_state(self) -> None:
+        if not self._project_bundle or self._project is None:
+            return
+        idx = self._active_subproject_index
+        if 0 <= idx < len(self._project_bundle.subprojects):
+            self._project_bundle.subprojects[idx] = self._project
+            self._subproject_truss_types[idx] = self._truss_type
+            self._subproject_results[idx] = self._last_result
+            self._subproject_undo_stacks[idx] = self._undo_stack
+            self._subproject_redo_stacks[idx] = self._redo_stack
+
+    def _activate_subproject(self, idx: int) -> None:
+        if not self._project_bundle or not (0 <= idx < len(self._project_bundle.subprojects)):
+            return
+        self._active_subproject_index = idx
+        self._project = self._project_bundle.subprojects[idx]
+        self._truss_type = self._subproject_truss_types[idx]
+        if self._truss_type is None and self._project.truss_type_id:
+            from trusscalc.database.db_manager import load_truss_type
+            self._truss_type = load_truss_type(self._project.truss_type_id)
+            self._subproject_truss_types[idx] = self._truss_type
+        self._last_result = self._subproject_results[idx]
+        self._undo_stack = self._subproject_undo_stacks[idx]
+        self._redo_stack = self._subproject_redo_stacks[idx]
+        self._canvas.load_project(self._project)
+        self._props.show_project_summary(self._project, self._truss_type)
+        if self._truss_type:
+            self._lbl_truss.setText(f"Traversentyp: {self._truss_type.display_name}")
+        else:
+            self._lbl_truss.setText("Kein Traversentyp ausgewählt")
+        if self._last_result and self._truss_type:
+            interp = LoadTableInterpolator(self._truss_type)
+            ei = interp.effective_ei(self._project.total_length_m)
+            sw = self._truss_type.weight_per_meter_kg if self._truss_type.has_weight else None
+            self._canvas.show_results(self._last_result, ei or 1.0, sw)
+        self._update_window_title()
+
+    def _on_tab_changed(self, idx: int) -> None:
+        if self._updating_tabs or idx < 0 or idx == self._active_subproject_index:
+            return
+        self._commit_active_subproject_state()
+        self._activate_subproject(idx)
+
+    def _on_tab_moved(self, from_idx: int, to_idx: int) -> None:
+        if (
+            self._updating_tabs
+            or not self._project_bundle
+            or from_idx == to_idx
+            or not (0 <= from_idx < len(self._project_bundle.subprojects))
+            or not (0 <= to_idx < len(self._project_bundle.subprojects))
+        ):
+            return
+        self._commit_active_subproject_state()
+        active_project = self._project
+
+        def move_item(items: list) -> None:
+            item = items.pop(from_idx)
+            items.insert(to_idx, item)
+
+        move_item(self._project_bundle.subprojects)
+        move_item(self._subproject_truss_types)
+        move_item(self._subproject_results)
+        move_item(self._subproject_undo_stacks)
+        move_item(self._subproject_redo_stacks)
+
+        try:
+            new_active = self._project_bundle.subprojects.index(active_project)
+        except ValueError:
+            new_active = self._tabs.currentIndex()
+        self._updating_tabs = True
+        self._tabs.setCurrentIndex(new_active)
+        self._updating_tabs = False
+        self._activate_subproject(new_active)
+        self._status.showMessage("Sub-Projekt-Reihenfolge aktualisiert")
+
+    def _add_subproject_tab(self) -> None:
+        if not self._project_bundle:
+            self._new_project()
+        name = f"Sub-Projekt {len(self._project_bundle.subprojects) + 1}"
+        project = self._create_empty_subproject(name)
+        self._commit_active_subproject_state()
+        self._project_bundle.subprojects.append(project)
+        self._subproject_truss_types.append(None)
+        self._subproject_results.append(None)
+        self._subproject_undo_stacks.append([])
+        self._subproject_redo_stacks.append([])
+        self._active_subproject_index = len(self._project_bundle.subprojects) - 1
+        self._refresh_tabs()
+        self._activate_subproject(self._active_subproject_index)
+
+    def _rename_subproject_tab(self) -> None:
+        if not self._project:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Sub-Projekt umbenennen", "Name:",
+            text=self._project.name or "Sub-Projekt",
+        )
+        if not ok or not name.strip():
+            return
+        self._project.name = name.strip()
+        self._commit_active_subproject_state()
+        self._refresh_tabs()
+        self._status.showMessage(f"Sub-Projekt umbenannt: {self._project.name}")
+
+    def _duplicate_subproject_tab(self) -> None:
+        if not self._project_bundle or not self._project:
+            return
+        self._commit_active_subproject_state()
+        clone = copy.deepcopy(self._project)
+        clone.name = f"{self._project.name or 'Sub-Projekt'} Kopie"
+        self._regenerate_element_ids(clone)
+        idx = self._active_subproject_index + 1
+        self._project_bundle.subprojects.insert(idx, clone)
+        self._subproject_truss_types.insert(idx, copy.deepcopy(self._truss_type))
+        self._subproject_results.insert(idx, None)
+        self._subproject_undo_stacks.insert(idx, [])
+        self._subproject_redo_stacks.insert(idx, [])
+        self._active_subproject_index = idx
+        self._refresh_tabs()
+        self._activate_subproject(idx)
+
+    def _delete_subproject_tab(self) -> None:
+        if not self._project_bundle or len(self._project_bundle.subprojects) <= 1:
+            QMessageBox.information(self, "Sub-Projekt löschen", "Mindestens ein Sub-Projekt muss bestehen bleiben.")
+            return
+        idx = self._active_subproject_index
+        reply = QMessageBox.question(
+            self, "Sub-Projekt löschen",
+            f"Sub-Projekt '{self._project.name}' löschen?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        del self._project_bundle.subprojects[idx]
+        del self._subproject_truss_types[idx]
+        del self._subproject_results[idx]
+        del self._subproject_undo_stacks[idx]
+        del self._subproject_redo_stacks[idx]
+        self._active_subproject_index = max(0, min(idx, len(self._project_bundle.subprojects) - 1))
+        self._refresh_tabs()
+        self._activate_subproject(self._active_subproject_index)
+
+    @staticmethod
+    def _regenerate_element_ids(project: Project) -> None:
+        for collection in (
+            project.sections, project.supports,
+            project.point_loads, project.distributed_loads,
+        ):
+            for element in collection:
+                element.id = str(uuid.uuid4())
+
     # ── Projekt-Verwaltung ────────────────────────────────────────────────────
 
     def _new_project(self) -> None:
-        self._project = None
-        self._truss_type = None
-        self._last_result = None
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        first = self._create_empty_subproject()
+        self._project_bundle = ProjectBundle(
+            name="Projekt",
+            unit_system=self._unit_combo.currentData(),
+            subprojects=[first],
+        )
+        self._subproject_truss_types = [None]
+        self._subproject_results = [None]
+        self._subproject_undo_stacks = [[]]
+        self._subproject_redo_stacks = [[]]
+        self._active_subproject_index = 0
         self._project_path = None
-        self._canvas.scene().clear()
-        self._props.show_project_summary(None, None)
-        self._lbl_truss.setText("Kein Traversentyp ausgewählt")
+        self._refresh_tabs()
+        self._activate_subproject(0)
         self._status.showMessage("Neues Projekt – Traversentyp auswählen")
-        self._update_window_title()
 
     def _use_truss_type(self, truss: TrussType) -> None:
-        if self._project and self._project.truss_type_id != truss.id:
+        if not self._project_bundle:
+            self._new_project()
+        if self._project and self._project.truss_type_id not in (0, truss.id):
             reply = QMessageBox.question(
                 self, "Traversentyp wechseln",
-                "Das aktuelle Projekt hat bereits einen Traversentyp. Neu anlegen?",
+                "Das aktuelle Sub-Projekt hat bereits einen anderen Traversentyp. "
+                "Neues Sub-Projekt anlegen?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
                 return
-            self._new_project()
+            self._add_subproject_tab()
 
         if not truss.has_weight:
             QMessageBox.warning(
@@ -246,17 +468,20 @@ class MainWindow(QMainWindow):
 
         self._truss_type = truss
         if self._project is None:
-            self._project = Project(
-                name=f"Projekt – {truss.name}",
-                truss_type_id=truss.id,
-            )
-            self._canvas.load_project(self._project)
-            self._props.show_project_summary(self._project, self._truss_type)
+            self._project = self._create_empty_subproject()
+        self._project.truss_type_id = truss.id
+        self._project.unit_system = self._unit_combo.currentData()
+        if not self._project.name:
+            self._project.name = f"Sub-Projekt {self._active_subproject_index + 1}"
+        self._commit_active_subproject_state()
+        self._canvas.load_project(self._project)
+        self._props.show_project_summary(self._project, self._truss_type)
+        self._refresh_tabs()
         self._lbl_truss.setText(f"Traversentyp: {truss.display_name}")
         self._status.showMessage(f"Traversentyp '{truss.display_name}' ausgewählt – Abschnitte und Auflager hinzufügen")
 
     def _open_project(self) -> None:
-        from trusscalc.database.db_manager import load_project_from_file, load_truss_type
+        from trusscalc.database.db_manager import load_project_from_file
         path, _ = QFileDialog.getOpenFileName(
             self, "Projekt öffnen", "",
             "TrussCalc-Projekt (*.tcproj);;JSON-Datei (*.json);;Alle Dateien (*)",
@@ -264,28 +489,22 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            project = load_project_from_file(path)
+            bundle = load_project_from_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Projekt laden fehlgeschlagen", str(exc))
             return
-        self._project = project
         self._project_path = path
-        self._truss_type = load_truss_type(project.truss_type_id)
-        if self._truss_type is None:
+        self._load_project_bundle(bundle)
+        if self._project and self._project.truss_type_id and self._truss_type is None:
             QMessageBox.warning(
                 self, "Traversentyp fehlt",
                 "Der zugehörige Traversentyp ist in dieser Datenbank nicht vorhanden. "
                 "Bitte den Typ zuerst importieren oder anlegen.",
             )
-        self._canvas.load_project(project)
-        self._props.show_project_summary(self._project, self._truss_type)
-        if self._truss_type:
-            self._lbl_truss.setText(f"Traversentyp: {self._truss_type.display_name}")
-        self._update_window_title()
-        self._status.showMessage(f"Projekt '{project.name}' geladen ({path})")
+        self._status.showMessage(f"Projekt '{bundle.name}' geladen ({path})")
 
     def _save_project(self) -> None:
-        if not self._project:
+        if not self._project_bundle:
             return
         if self._project_path:
             self._write_project_file(self._project_path)
@@ -293,10 +512,10 @@ class MainWindow(QMainWindow):
             self._save_project_as()
 
     def _save_project_as(self) -> None:
-        if not self._project:
+        if not self._project_bundle:
             QMessageBox.information(self, "Speichern", "Kein Projekt zum Speichern vorhanden.")
             return
-        suggested = self._project.name or "Projekt"
+        suggested = self._project_bundle.name or "Projekt"
         path, _ = QFileDialog.getSaveFileName(
             self, "Projekt speichern unter", f"{suggested}.tcproj",
             "TrussCalc-Projekt (*.tcproj);;JSON-Datei (*.json);;Alle Dateien (*)",
@@ -305,15 +524,16 @@ class MainWindow(QMainWindow):
             return
         # Namen ggf. aus Dateinamen ableiten
         from pathlib import Path as _P
-        if not self._project.name or self._project.name.startswith("Projekt –"):
-            self._project.name = _P(path).stem
+        if not self._project_bundle.name or self._project_bundle.name == "Projekt":
+            self._project_bundle.name = _P(path).stem
         self._project_path = path
         self._write_project_file(path)
 
     def _write_project_file(self, path: str) -> None:
         from trusscalc.database.db_manager import save_project_to_file
         try:
-            save_project_to_file(path, self._project)
+            self._commit_active_subproject_state()
+            save_project_to_file(path, self._project_bundle)
         except Exception as exc:
             QMessageBox.critical(self, "Speichern fehlgeschlagen", str(exc))
             return
@@ -322,8 +542,10 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self) -> None:
         title = "TrussCalc"
-        if self._project and self._project.name:
-            title = f"TrussCalc – {self._project.name}"
+        if self._project_bundle and self._project_bundle.name:
+            title = f"TrussCalc – {self._project_bundle.name}"
+            if self._project and self._project.name:
+                title += f" / {self._project.name}"
             if self._project_path:
                 title += f"  [{self._project_path}]"
         self.setWindowTitle(title)
@@ -551,7 +773,7 @@ class MainWindow(QMainWindow):
         self._copy_templates = [copy.deepcopy(e) for e in selected]
         self._canvas.begin_copy_mode(self._copy_templates)
         self._status.showMessage(
-            f"{len(selected)} Objekt(e) kopiert - Linksklick platziert, Rechtsklick bricht ab"
+            f"{len(selected)} Objekt(e) kopiert - Linksklick platziert, Rechtsklick/Esc bricht ab"
         )
 
     def _paste_copy(self) -> None:
@@ -559,7 +781,7 @@ class MainWindow(QMainWindow):
             self._copy_selected()
             return
         self._canvas.begin_copy_mode(self._copy_templates)
-        self._status.showMessage("Kopie bereit - Linksklick platziert, Rechtsklick bricht ab")
+        self._status.showMessage("Kopie bereit - Linksklick platziert, Rechtsklick/Esc bricht ab")
 
     def _place_copy_at(self, anchor_m: float) -> None:
         if not self._project or not self._copy_templates:
@@ -698,6 +920,7 @@ class MainWindow(QMainWindow):
             self._redo_stack.append(copy.deepcopy(self._project))
         self._project = self._undo_stack.pop()
         self._last_result = None
+        self._commit_active_subproject_state()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
         self._update_window_title()
@@ -711,6 +934,7 @@ class MainWindow(QMainWindow):
             self._undo_stack.append(copy.deepcopy(self._project))
         self._project = self._redo_stack.pop()
         self._last_result = None
+        self._commit_active_subproject_state()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
         self._update_window_title()
@@ -754,6 +978,7 @@ class MainWindow(QMainWindow):
             progress.close()
 
         self._last_result = result
+        self._commit_active_subproject_state()
 
         if result.warnings:
             QMessageBox.warning(self, "Berechnungshinweise", "\n".join(result.warnings))
@@ -773,6 +998,7 @@ class MainWindow(QMainWindow):
 
     def _clear_results(self) -> None:
         self._last_result = None
+        self._commit_active_subproject_state()
         self._canvas.clear_results()
 
     def _fit_view(self) -> None:
@@ -781,9 +1007,14 @@ class MainWindow(QMainWindow):
     # ── Einheiten ─────────────────────────────────────────────────────────────
 
     def _on_unit_changed(self, idx: int) -> None:
+        unit = self._unit_combo.currentData()
+        if self._project_bundle:
+            self._project_bundle.unit_system = unit
+            for project in self._project_bundle.subprojects:
+                project.unit_system = unit
         if self._project:
-            self._project.unit_system = self._unit_combo.currentData()
-        self._props.set_unit_system(self._unit_combo.currentData())
+            self._project.unit_system = unit
+        self._props.set_unit_system(unit)
         if self._project:
             self._canvas.load_project(self._project)
             if self._last_result and self._truss_type:
@@ -1009,7 +1240,52 @@ class MainWindow(QMainWindow):
     # ── PDF-Report ────────────────────────────────────────────────────────────
 
     def _generate_pdf(self) -> None:
-        if not self._last_result:
+        if not self._project_bundle:
+            QMessageBox.information(self, "PDF-Report", "Kein Projekt vorhanden.")
+            return
+        self._commit_active_subproject_state()
+
+        chapters = []
+        missing = []
+        for idx, project in enumerate(self._project_bundle.subprojects):
+            truss_type = self._subproject_truss_types[idx]
+            if truss_type is None and project.truss_type_id:
+                from trusscalc.database.db_manager import load_truss_type
+                truss_type = load_truss_type(project.truss_type_id)
+                self._subproject_truss_types[idx] = truss_type
+            result = self._subproject_results[idx]
+            if result is None and truss_type and project.sections and project.supports:
+                try:
+                    result = calculator.calculate(project, truss_type)
+                    self._subproject_results[idx] = result
+                except Exception:
+                    result = None
+            if truss_type and result:
+                chapters.append((idx, project, truss_type, result))
+            else:
+                missing.append(project.name or f"Sub-Projekt {idx + 1}")
+
+        if missing:
+            if chapters:
+                reply = QMessageBox.question(
+                    self,
+                    "PDF-Report",
+                    "Nicht alle Sub-Projekte sind berechnet:\n"
+                    + "\n".join(f"- {name}" for name in missing)
+                    + "\n\nNur berechnete Sub-Projekte exportieren?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            else:
+                QMessageBox.information(
+                    self,
+                    "PDF-Report",
+                    "Bitte zuerst mindestens ein Sub-Projekt berechnen.",
+                )
+                return
+
+        if not chapters:
             QMessageBox.information(self, "PDF-Report",
                                     "Bitte zuerst eine Berechnung durchführen.")
             return
@@ -1025,7 +1301,7 @@ class MainWindow(QMainWindow):
 
         # Ziel-Dateiname vorschlagen
         suggested = metadata.project_name or "Report"
-        if metadata.sub_project_name:
+        if len(chapters) == 1 and metadata.sub_project_name:
             suggested += f" – {metadata.sub_project_name}"
         path, _ = QFileDialog.getSaveFileName(
             self, "PDF-Report speichern", f"{suggested}.pdf", "PDF (*.pdf)")
@@ -1040,30 +1316,31 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
         from trusscalc.database.db_manager import load_truss_pdf
-        pdf_bytes = load_truss_pdf(self._truss_type.id)
+        report_chapters = []
+        for _idx, project, truss_type, result in chapters:
+            report_chapters.append({
+                "project": copy.deepcopy(project),
+                "truss_type": copy.deepcopy(truss_type),
+                "result": copy.deepcopy(result),
+                "datasheet_pdf_bytes": load_truss_pdf(truss_type.id),
+            })
 
         class _PdfWorker(QThread):
             done_signal = pyqtSignal(str)
             error_signal = pyqtSignal(str)
 
-            def __init__(self, pdf_path, project, truss_type, result, datasheet_bytes, report_metadata):
+            def __init__(self, pdf_path, chapter_data, report_metadata):
                 super().__init__()
                 self.pdf_path = pdf_path
-                self.project = project
-                self.truss_type = truss_type
-                self.result = result
-                self.datasheet_bytes = datasheet_bytes
+                self.chapter_data = chapter_data
                 self.report_metadata = report_metadata
 
             def run(self):
                 try:
-                    from trusscalc.pdf.pdf_generator import generate_report
-                    generate_report(
+                    from trusscalc.pdf.pdf_generator import generate_project_report
+                    generate_project_report(
                         path=self.pdf_path,
-                        project=self.project,
-                        truss_type=self.truss_type,
-                        result=self.result,
-                        datasheet_pdf_bytes=self.datasheet_bytes,
+                        chapters=self.chapter_data,
                         metadata=self.report_metadata,
                     )
                     self.done_signal.emit(self.pdf_path)
@@ -1072,10 +1349,7 @@ class MainWindow(QMainWindow):
 
         worker = _PdfWorker(
             path,
-            copy.deepcopy(self._project),
-            copy.deepcopy(self._truss_type),
-            copy.deepcopy(self._last_result),
-            pdf_bytes,
+            report_chapters,
             metadata,
         )
 
@@ -1098,9 +1372,12 @@ class MainWindow(QMainWindow):
     # ── Design ────────────────────────────────────────────────────────────────
 
     def _default_report_project_name(self) -> str:
-        if not self._project or not self._project.name:
+        if self._project_bundle and self._project_bundle.name:
+            name = self._project_bundle.name.strip()
+        elif self._project and self._project.name:
+            name = self._project.name.strip()
+        else:
             return "Projekt"
-        name = self._project.name.strip()
         name = name.replace("Projekt \u2013 ", "").replace("Projekt - ", "").replace("Projekt-", "")
         for prefix in ("Projekt â€“ ", "Projekt - ", "Projekt-"):
             if name.startswith(prefix):
@@ -1187,6 +1464,14 @@ class MainWindow(QMainWindow):
             return
         if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_M:
             self._mirror_selected()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Escape:
+            if self._canvas.is_copy_mode_active():
+                self._canvas.cancel_copy_mode()
+                self._status.showMessage("Kopieren abgebrochen")
+            else:
+                self._set_tool(CanvasTool.SELECT)
             event.accept()
             return
         if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Delete:

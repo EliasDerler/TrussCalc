@@ -185,3 +185,17 @@ class Project:
             return 0.0
         last = max(self.sections, key=lambda s: s.position_m + s.length_m)
         return last.position_m + last.length_m
+
+
+@dataclass
+class ProjectBundle:
+    """Container fuer ein Gesamtprojekt mit mehreren Sub-Projekten."""
+    name: str
+    subprojects: list[Project] = field(default_factory=list)
+    unit_system: UnitSystem = UnitSystem.KG_M
+    description: str = ""
+    id: Optional[int] = None
+
+    @property
+    def active_or_first_project(self) -> Optional[Project]:
+        return self.subprojects[0] if self.subprojects else None

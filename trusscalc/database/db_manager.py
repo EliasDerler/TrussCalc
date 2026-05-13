@@ -7,7 +7,7 @@ from typing import Optional
 
 from trusscalc.core.models import (
     TrussType, LoadTableEntry, LoadType, TrussSource, Project,
-    TrussSection, Support, PointLoad, DistributedLoad, UnitSystem,
+    ProjectBundle, TrussSection, Support, PointLoad, DistributedLoad, UnitSystem,
 )
 
 _DB_PATH = Path(os.environ.get("TRUSSCALC_DB", "trusscalc.db"))
@@ -192,31 +192,33 @@ def load_truss_pdf(truss_type_id: int) -> Optional[bytes]:
 
 # ── Projekte ──────────────────────────────────────────────────────────────────
 
-def save_project(project: Project) -> int:
-    data = _project_to_json(project)
+def save_project(project: Project | ProjectBundle) -> int:
+    bundle = _ensure_bundle(project)
+    data = _bundle_to_json(bundle)
     with get_connection() as conn:
-        if project.id is None:
+        if bundle.id is None:
             cur = conn.execute(
                 """INSERT INTO projects (name, description, project_data,
                    modified_at) VALUES (?,?,?, CURRENT_TIMESTAMP)""",
-                (project.name, project.description, data),
+                (bundle.name, bundle.description, data),
             )
-            project.id = cur.lastrowid
+            bundle.id = cur.lastrowid
+            project.id = bundle.id
         else:
             conn.execute(
                 """UPDATE projects SET name=?, description=?, project_data=?,
                    modified_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (project.name, project.description, data, project.id),
+                (bundle.name, bundle.description, data, bundle.id),
             )
-    return project.id
+    return bundle.id
 
 
-def load_project(project_id: int) -> Optional[Project]:
+def load_project(project_id: int) -> Optional[ProjectBundle]:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
         if row is None:
             return None
-        return _json_to_project(row["project_data"], row["id"], row["name"], row["description"])
+        return _json_to_bundle(row["project_data"], row["id"], row["name"], row["description"])
 
 
 def list_projects() -> list[dict]:
@@ -298,4 +300,101 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
         supports=supports,
         point_loads=point_loads,
         distributed_loads=distributed_loads,
+    )
+
+
+def _project_to_dict_v2(project: Project) -> dict:
+    data = json.loads(_project_to_json(project))
+    data["name"] = project.name
+    data["description"] = project.description
+    return data
+
+
+def _ensure_bundle(project: Project | ProjectBundle) -> ProjectBundle:
+    if isinstance(project, ProjectBundle):
+        return project
+    return ProjectBundle(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        unit_system=project.unit_system,
+        subprojects=[project],
+    )
+
+
+def _bundle_to_json(bundle: ProjectBundle) -> str:
+    return json.dumps({
+        "format_version": 2,
+        "unit_system": bundle.unit_system.value,
+        "subprojects": [_project_to_dict_v2(p) for p in bundle.subprojects],
+    }, ensure_ascii=False)
+
+
+def _dict_to_project_v2(data: dict, name: str = "", desc: str = "") -> Project:
+    project = _json_to_project(
+        json.dumps(data),
+        pid=None,
+        name=data.get("name") or name,
+        desc=data.get("description") or desc,
+    )
+    return project
+
+
+def _json_to_bundle(data: str, pid: int, name: str, desc: str) -> ProjectBundle:
+    payload = json.loads(data)
+    if "subprojects" not in payload:
+        project = _json_to_project(data, None, name or "Sub-Projekt 1", desc)
+        if not project.name:
+            project.name = "Sub-Projekt 1"
+        return ProjectBundle(
+            id=pid,
+            name=name or project.name or "Projekt",
+            description=desc,
+            unit_system=project.unit_system,
+            subprojects=[project],
+        )
+    unit = UnitSystem(payload.get("unit_system", UnitSystem.KG_M.value))
+    projects = [
+        _dict_to_project_v2(
+            sub,
+            name=sub.get("name") or f"Sub-Projekt {idx + 1}",
+            desc=sub.get("description", ""),
+        )
+        for idx, sub in enumerate(payload.get("subprojects", []))
+    ]
+    if not projects:
+        projects = [Project(name="Sub-Projekt 1", truss_type_id=0, unit_system=unit)]
+    for project in projects:
+        project.unit_system = unit
+    return ProjectBundle(
+        id=pid,
+        name=name or "Projekt",
+        description=desc,
+        unit_system=unit,
+        subprojects=projects,
+    )
+
+
+def save_project_to_file(path: str, project: Project | ProjectBundle) -> None:
+    """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON v2)."""
+    bundle = _ensure_bundle(project)
+    payload = {
+        "format_version": 2,
+        "name": bundle.name,
+        "description": bundle.description,
+        "data": json.loads(_bundle_to_json(bundle)),
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+
+def load_project_from_file(path: str) -> ProjectBundle:
+    """Lädt ein Projekt aus einer .tcproj-Datei und migriert v1 nach v2."""
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    return _json_to_bundle(
+        json.dumps(payload["data"]),
+        pid=None,
+        name=payload.get("name", "Unbenannt"),
+        desc=payload.get("description", ""),
     )
