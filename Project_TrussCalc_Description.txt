@@ -1,0 +1,74 @@
+Project TrussCalc
+
+- Einlesen von Traversen Datenblättern (.PDF)
+- Speichern der Datenblätter in lokaler Datenbank
+- 2D Visualisierung 
+	- Bereits in der Datenbank gespeicherte oder neu hinzugefügte Traversen können hinzugefügt werden.
+	- Traversen können verbunden werden. 
+		- Bsp. 2 Stück 3m Traverse verbinden zu 6m Traverse
+	- Es können beliebig viele Traversen verbunden werden
+	- Es soll aber nur eine Traversen-Strecke erstellt werden können
+	- Auflager können hinzugefügt werden
+		- Nicht mit Traverse fix verbunden -> Traverse liegt nur am Auflager auf
+			- d.h. bei zu großer Last auf einer Seite der Strecke kann die Traverse von einem Auflager abheben
+		- Es können beliebig viel Auflager hinzugefügt werden
+		- Es kann die maximale aufnehmbare Kraft eines Auflagers angegeben werden
+	- Es können beliebig viele Lastpunkte auf der Traversen-Strecke hinzugefügt werden
+	- Es können beliebig viele Streckenlasten auf der Traversen-Strecke hinzugefügt werden
+	- Es können Streckenlasten und Punktlasten kombiniert bzw. übereinandergelegt werden
+	- Auflager und Punktlasten werden mit cm auf der Traversen-Strecke bemaßt und platziert
+	- Alle Bauteile bzw. Werte sollten mittels einem Eingabe-Fenster oder durch Drag&Drop eingefügt werden können
+- Berechnungen
+	- Biegung der Traverse
+	- Jeweilige Kräfte am Auflager
+	- Alle Berechnungen sollten auf Basis der Belastungstabelle welche vom Datenblatt eingelesen wurde durchgeführt werden.
+- 2D Visualisierung nach Berechnung
+	- Die Jeweiligen Kräfte werden am Auflager angezeigt
+		- Ist die vertikale Kraft Richtung Boden größer als 80% der Maximal aufnehmbaren Kraft des Auflagers so soll das Auflager Gelb 			gekennzeichnet 	werden
+		- Ist die die vertikale Kraft Richtung Boden größer als die  Maximal aufnehmbaren Kraft des Auflagers so soll das Auflager Rot 			gekennzeichnet 	werden
+		- Ist die vertikale Kraft Richtung Boden kleiner bzw. gleich 0 soll das Auflager Blau gekennzeichnet werden.
+	- Die Biegung der Traversen-Strecke wird grafisch dargestellt und in cm bemaßt
+		- Ist die Biegung der Traverse zu groß wird diese Rot gekennzeichnet (mit Berechneten Wert aus Datenblatt vergleichen)
+		- Ist die Biegung der Traverse bei Theoretischer Vergrößerung der Last auf 120% (100% = Momentane Last) größer als die Maximale 		Biegung so wird diese Gelb gekennzeichnet
+		- Würde die Traverse bei entfernen eines Auflagers nur 20% der Maximalen Biegung erreichen, so soll das Auflager welches entfernt  		werden könnte grün gekennzeichnet werden
+- Output
+	- Es soll die Möglichkeit bestehen ein PDF zu erstellen welches das Simulierte Traversen-System (Traversen-Strecke, Auflager, 	Lasten/Kräfte, Biegung der Traverse, Bemaßungen, Farbliche Markierungen, Legende, Stückzahlen, Datenblatt der Traverse, 2D-Visualisation,) 	darstellt. 
+	- Auf den Letzten Seiten des PDFs soll das Datenblatt der Traverse angehängt sein
+
+- Design
+	- Das Design und so weit wie möglich Bedienung sollte an die Elektrotechnik Simulationssoftware "LT-Spice" angelehnt sein.
+
+- Funktion
+	- Dieses Programm soll auf Windows-Rechnern ausgeführt werden können
+	- Keine Webbasierte Darstellung
+	- Es sollte keine Internetverbindung benötigt werden um das Programm zu benutzen
+
+- Ablauf des Erstellungsprozesses 
+	1. Analyse der Aufgabenstellung
+	2. Besprechung der Möglichkeiten für die Berechnung aller benötigten Werte 
+	3. Ausarbeitung der Funktionen
+	4. Ausarbeitung des Outputs (PDF)
+	5. Ausarbeitung der 2D Visualisierung
+	6. Ausarbeitung der Funktion und Rolle der Datenbank
+	4. Ausarbeitung des Designs
+	- Zu all diesen Punkten sollten Fragen gestellt werden um gemeinsam eine umsetzbare Aufgabenstellung zu gestalten
+	- Sollten Fragen auftreten sollte immer gefragt werden.
+
+Nach der Besprechung des kompletten Projekt soll erst das Programmieren begonnen werden.
+
+- Anhang:
+	- Beispiele für Datenblätter einer Traverse
+		https://images.thomann.de/pics/atg/atgdata/document/specs/globaltruss_f34_db_uk.pdf
+		https://motion-sales.de/downloads/artikelpdfs/div0014-Eurotruss_XD_specs_ENG.pdf
+		https://motion-sales.de/downloads/artikelpdfs/div0011-Eurotruss_ST_specs_ENG.pdf
+	- LT-Spice
+		https://en.wikipedia.org/wiki/LTspice
+		https://www.analog.com/en/resources/design-tools-and-calculators/ltspice-simulator.html
+
+Allgemeine Instruktionen
+	- Führe eigene recherche durch um Möglichkeiten zur Berechnung, Design etc. zu finden (beachte trotzdem die gesendeten Links)
+	- Das gesamte Projekt sollte auf GitHub auch gespeichert werden um spätere Versionen hinzuzufügen
+	
+	
+
+	
