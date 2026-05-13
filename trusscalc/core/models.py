@@ -104,6 +104,27 @@ class DistributedLoad:
 
 
 @dataclass
+class TrussSystem:
+    """Ein statisch unabhaengiges Traversensystem innerhalb eines Sub-Projekts."""
+    name: str
+    truss_type_id: int = 0
+    canvas_x_m: float = 0.0
+    canvas_y_m: float = 0.0
+    sections: list[TrussSection] = field(default_factory=list)
+    supports: list[Support] = field(default_factory=list)
+    point_loads: list[PointLoad] = field(default_factory=list)
+    distributed_loads: list[DistributedLoad] = field(default_factory=list)
+    id: Optional[str] = None
+
+    @property
+    def total_length_m(self) -> float:
+        if not self.sections:
+            return 0.0
+        last = max(self.sections, key=lambda s: s.position_m + s.length_m)
+        return last.position_m + last.length_m
+
+
+@dataclass
 class SupportResult:
     """Berechnungsergebnis für ein Auflager."""
     support: Support
@@ -175,16 +196,34 @@ class Project:
     supports: list[Support] = field(default_factory=list)
     point_loads: list[PointLoad] = field(default_factory=list)
     distributed_loads: list[DistributedLoad] = field(default_factory=list)
+    systems: list[TrussSystem] = field(default_factory=list)
+    active_system_id: Optional[str] = None
+    plan_system_id: Optional[str] = None
+    compare_system_ids: list[str] = field(default_factory=list)
+    view_mode: str = "plan"
     unit_system: UnitSystem = UnitSystem.KG_M
     description: str = ""
     id: Optional[int] = None
 
     @property
     def total_length_m(self) -> float:
+        system = self.active_system
+        if system is not None:
+            return system.total_length_m
         if not self.sections:
             return 0.0
         last = max(self.sections, key=lambda s: s.position_m + s.length_m)
         return last.position_m + last.length_m
+
+    @property
+    def active_system(self) -> Optional[TrussSystem]:
+        if not self.systems:
+            return None
+        if self.active_system_id:
+            for system in self.systems:
+                if system.id == self.active_system_id:
+                    return system
+        return self.systems[0]
 
 
 @dataclass

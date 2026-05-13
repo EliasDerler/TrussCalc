@@ -7,7 +7,8 @@ from typing import Optional
 
 from trusscalc.core.models import (
     TrussType, LoadTableEntry, LoadType, TrussSource, Project,
-    ProjectBundle, TrussSection, Support, PointLoad, DistributedLoad, UnitSystem,
+    ProjectBundle, TrussSystem, TrussSection, Support, PointLoad,
+    DistributedLoad, UnitSystem,
 )
 
 _DB_PATH = Path(os.environ.get("TRUSSCALC_DB", "trusscalc.db"))
@@ -259,6 +260,40 @@ def _project_to_json(project: Project) -> str:
     }, ensure_ascii=False)
 
 
+def _system_to_dict(system: TrussSystem) -> dict:
+    data = json.loads(_project_to_json(Project(
+        name=system.name,
+        truss_type_id=system.truss_type_id,
+        sections=system.sections,
+        supports=system.supports,
+        point_loads=system.point_loads,
+        distributed_loads=system.distributed_loads,
+    )))
+    data.update({
+        "id": system.id,
+        "name": system.name,
+        "canvas_x_m": system.canvas_x_m,
+        "canvas_y_m": system.canvas_y_m,
+    })
+    return data
+
+
+def _dict_to_system(data: dict, idx: int = 0) -> TrussSystem:
+    return TrussSystem(
+        id=data.get("id"),
+        name=data.get("name") or f"System {idx + 1}",
+        truss_type_id=int(data.get("truss_type_id") or 0),
+        canvas_x_m=float(data.get("canvas_x_m", 0.0)),
+        canvas_y_m=float(data.get("canvas_y_m", idx)),
+        sections=[TrussSection(**s) for s in data.get("sections", [])],
+        supports=[Support(**s) for s in data.get("supports", [])],
+        point_loads=[PointLoad(**p) for p in data.get("point_loads", [])],
+        distributed_loads=[
+            DistributedLoad(**dl) for dl in data.get("distributed_loads", [])
+        ],
+    )
+
+
 def save_project_to_file(path: str, project: Project) -> None:
     """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON)."""
     payload = {
@@ -290,7 +325,7 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
     supports = [Support(**s) for s in d.get("supports", [])]
     point_loads = [PointLoad(**p) for p in d.get("point_loads", [])]
     distributed_loads = [DistributedLoad(**dl) for dl in d.get("distributed_loads", [])]
-    return Project(
+    project = Project(
         id=pid,
         name=name,
         description=desc,
@@ -300,13 +335,35 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
         supports=supports,
         point_loads=point_loads,
         distributed_loads=distributed_loads,
+        systems=[
+            _dict_to_system(system_data, idx)
+            for idx, system_data in enumerate(d.get("systems", []))
+        ],
+        active_system_id=d.get("active_system_id"),
+        plan_system_id=d.get("plan_system_id"),
+        compare_system_ids=list(d.get("compare_system_ids", [])),
+        view_mode=d.get("view_mode", "plan"),
     )
+    if not project.systems and (
+        project.truss_type_id or project.sections or project.supports
+        or project.point_loads or project.distributed_loads
+    ):
+        project.systems = [_legacy_project_to_system(project)]
+        project.active_system_id = project.systems[0].id
+    _ensure_project_systems(project)
+    return project
 
 
 def _project_to_dict_v2(project: Project) -> dict:
+    _ensure_project_systems(project)
     data = json.loads(_project_to_json(project))
     data["name"] = project.name
     data["description"] = project.description
+    data["active_system_id"] = project.active_system_id
+    data["plan_system_id"] = project.plan_system_id
+    data["compare_system_ids"] = project.compare_system_ids
+    data["view_mode"] = project.view_mode
+    data["systems"] = [_system_to_dict(system) for system in project.systems]
     return data
 
 
@@ -324,7 +381,7 @@ def _ensure_bundle(project: Project | ProjectBundle) -> ProjectBundle:
 
 def _bundle_to_json(bundle: ProjectBundle) -> str:
     return json.dumps({
-        "format_version": 2,
+        "format_version": 3,
         "unit_system": bundle.unit_system.value,
         "subprojects": [_project_to_dict_v2(p) for p in bundle.subprojects],
     }, ensure_ascii=False)
@@ -366,6 +423,7 @@ def _json_to_bundle(data: str, pid: int, name: str, desc: str) -> ProjectBundle:
         projects = [Project(name="Sub-Projekt 1", truss_type_id=0, unit_system=unit)]
     for project in projects:
         project.unit_system = unit
+        _ensure_project_systems(project)
     return ProjectBundle(
         id=pid,
         name=name or "Projekt",
@@ -376,10 +434,10 @@ def _json_to_bundle(data: str, pid: int, name: str, desc: str) -> ProjectBundle:
 
 
 def save_project_to_file(path: str, project: Project | ProjectBundle) -> None:
-    """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON v2)."""
+    """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON v3)."""
     bundle = _ensure_bundle(project)
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "name": bundle.name,
         "description": bundle.description,
         "data": json.loads(_bundle_to_json(bundle)),
@@ -389,7 +447,7 @@ def save_project_to_file(path: str, project: Project | ProjectBundle) -> None:
 
 
 def load_project_from_file(path: str) -> ProjectBundle:
-    """Lädt ein Projekt aus einer .tcproj-Datei und migriert v1 nach v2."""
+    """Lädt ein Projekt aus einer .tcproj-Datei und migriert v1/v2 nach v3."""
     with open(path, "r", encoding="utf-8") as fh:
         payload = json.load(fh)
     return _json_to_bundle(
@@ -398,3 +456,69 @@ def load_project_from_file(path: str) -> ProjectBundle:
         name=payload.get("name", "Unbenannt"),
         desc=payload.get("description", ""),
     )
+
+
+def _legacy_project_to_system(project: Project) -> TrussSystem:
+    import uuid
+    return TrussSystem(
+        id=str(uuid.uuid4()),
+        name="System 1",
+        truss_type_id=project.truss_type_id,
+        canvas_x_m=0.0,
+        canvas_y_m=0.0,
+        sections=project.sections,
+        supports=project.supports,
+        point_loads=project.point_loads,
+        distributed_loads=project.distributed_loads,
+    )
+
+
+def _ensure_project_systems(project: Project) -> None:
+    import uuid
+    if not project.systems:
+        if (
+            project.truss_type_id or project.sections or project.supports
+            or project.point_loads or project.distributed_loads
+        ):
+            project.systems = [_legacy_project_to_system(project)]
+        else:
+            project.systems = [TrussSystem(id=str(uuid.uuid4()), name="System 1")]
+    needs_layout = (
+        len(project.systems) > 1
+        and all(abs(float(system.canvas_y_m)) < 1e-9 for system in project.systems)
+    )
+    for idx, system in enumerate(project.systems):
+        if not system.id:
+            system.id = str(uuid.uuid4())
+        if not system.name:
+            system.name = f"System {idx + 1}"
+        if needs_layout:
+            system.canvas_y_m = float(idx)
+    if not project.active_system_id or all(
+        system.id != project.active_system_id for system in project.systems
+    ):
+        project.active_system_id = project.systems[0].id
+    if not project.plan_system_id or all(
+        system.id != project.plan_system_id for system in project.systems
+    ):
+        project.plan_system_id = project.active_system_id
+    valid_ids = {system.id for system in project.systems}
+    project.compare_system_ids = [
+        system_id for system_id in project.compare_system_ids if system_id in valid_ids
+    ]
+    if not project.compare_system_ids:
+        project.compare_system_ids = [system.id for system in project.systems if system.id != project.plan_system_id]
+        if not project.compare_system_ids:
+            project.compare_system_ids = [project.plan_system_id]
+    _sync_project_to_active_system(project)
+
+
+def _sync_project_to_active_system(project: Project) -> None:
+    system = project.active_system
+    if system is None:
+        return
+    project.truss_type_id = system.truss_type_id
+    project.sections = system.sections
+    project.supports = system.supports
+    project.point_loads = system.point_loads
+    project.distributed_loads = system.distributed_loads

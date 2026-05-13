@@ -12,14 +12,14 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QFileDialog, QInputDialog, QLabel,
     QComboBox, QSplitter, QDialog, QApplication, QProgressDialog,
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
-    QPushButton, QTabWidget,
+    QPushButton, QTabWidget, QMenu,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QIcon
 
 from trusscalc.core.models import (
-    Project, ProjectBundle, TrussType, TrussSection, Support, PointLoad, DistributedLoad,
-    UnitSystem, CalculationResult,
+    Project, ProjectBundle, TrussSystem, TrussType, TrussSection, Support,
+    PointLoad, DistributedLoad, UnitSystem, CalculationResult,
 )
 from trusscalc.core import calculator
 from trusscalc.core.interpolator import LoadTableInterpolator
@@ -45,8 +45,8 @@ class MainWindow(QMainWindow):
         self._undo_stack: list = []
         self._redo_stack: list = []
         self._active_subproject_index = 0
-        self._subproject_truss_types: list[Optional[TrussType]] = []
-        self._subproject_results: list[Optional[CalculationResult]] = []
+        self._subproject_truss_types: list[dict[str, TrussType]] = []
+        self._subproject_results: list[dict[str, CalculationResult]] = []
         self._subproject_undo_stacks: list[list] = []
         self._subproject_redo_stacks: list[list] = []
         self._updating_tabs = False
@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
         # Simulation
         sim_menu = mb.addMenu("&Simulation")
         sim_menu.addAction(self._action("Berechnen", self._run_calculation, "F5"))
-        sim_menu.addAction(self._action("Ergebnisse löschen", self._clear_results, "F6"))
+        sim_menu.addAction(self._action("Ergebnisse löschen", self._clear_all_results_in_tab, "F6"))
 
         # Ausgabe
         out_menu = mb.addMenu("&Ausgabe")
@@ -104,7 +104,8 @@ class MainWindow(QMainWindow):
 
         # Ansicht
         view_menu = mb.addMenu("&Ansicht")
-        view_menu.addAction(self._action("Ansicht anpassen", self._fit_view, "Space"))
+        view_menu.addAction(self._action("Gewaehltes System zentrieren", self._fit_view))
+        view_menu.addAction(self._action("Alle Systeme zentrieren", self._fit_all_view, "Ctrl+Space"))
 
     def _setup_toolbar(self) -> None:
         tb = QToolBar("Werkzeuge")
@@ -138,7 +139,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self._action("Spiegeln", self._mirror_selected))
         tb.addSeparator()
         tb.addAction(self._action("▶▶ Berechnen [F5]", self._run_calculation))
-        tb.addAction(self._action("✕ Reset", self._clear_results))
+        tb.addAction(self._action("✕ Reset", self._clear_all_results_in_tab))
 
         tb.addSeparator()
         tb.addWidget(QLabel("  Einheit: "))
@@ -147,6 +148,12 @@ class MainWindow(QMainWindow):
         self._unit_combo.addItem("N / kN", UnitSystem.N_M)
         self._unit_combo.currentIndexChanged.connect(self._on_unit_changed)
         tb.addWidget(self._unit_combo)
+        tb.addWidget(QLabel("  Modus: "))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Planen", "plan")
+        self._mode_combo.addItem("Vergleichen", "compare")
+        self._mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        tb.addWidget(self._mode_combo)
 
         self._act_select.setChecked(True)
 
@@ -164,6 +171,7 @@ class MainWindow(QMainWindow):
         self._canvas.request_point_load_dialog.connect(self._on_add_point_load)
         self._canvas.request_dist_load_dialog.connect(self._on_add_dist_load)
         self._canvas.request_section_dialog.connect(self._on_add_section)
+        self._canvas.system_selected.connect(self._on_canvas_system_selected)
         self._canvas.element_selected.connect(self._on_element_selected)
         self._canvas.element_deleted.connect(self._on_element_deleted)
         self._canvas.element_context_requested.connect(self._on_edit_element)
@@ -186,6 +194,8 @@ class MainWindow(QMainWindow):
         self._tabs.setMaximumHeight(34)
         self._tabs.currentChanged.connect(self._on_tab_changed)
         self._tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+        self._tabs.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tabs.tabBar().customContextMenuRequested.connect(self._show_tab_context_menu)
 
         tab_buttons = QHBoxLayout()
         tab_buttons.setContentsMargins(0, 0, 0, 0)
@@ -204,12 +214,33 @@ class MainWindow(QMainWindow):
             tab_buttons.addWidget(btn)
         tab_buttons.addStretch(1)
 
+        self._system_bar = QWidget()
+        system_row = QHBoxLayout(self._system_bar)
+        system_row.setContentsMargins(0, 0, 0, 0)
+        system_row.addWidget(QLabel("System:"))
+        self._system_combo = QComboBox()
+        self._system_combo.currentIndexChanged.connect(self._on_system_changed)
+        self._btn_system_new = QPushButton("System Neu")
+        self._btn_system_rename = QPushButton("Umbenennen")
+        self._btn_system_duplicate = QPushButton("Duplizieren")
+        self._btn_system_delete = QPushButton("Löschen")
+        self._btn_system_new.clicked.connect(self._add_system)
+        self._btn_system_rename.clicked.connect(self._rename_system)
+        self._btn_system_duplicate.clicked.connect(self._duplicate_system)
+        self._btn_system_delete.clicked.connect(self._delete_system)
+        system_row.addWidget(self._system_combo, 1)
+        for btn in (
+            self._btn_system_new, self._btn_system_rename,
+            self._btn_system_duplicate, self._btn_system_delete,
+        ):
+            system_row.addWidget(btn)
+
         center = QWidget()
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(3)
         center_layout.addWidget(self._tabs)
-        center_layout.addLayout(tab_buttons)
+        center_layout.addWidget(self._system_bar)
         center_layout.addWidget(self._canvas, 1)
 
         splitter.addWidget(self._library)
@@ -252,14 +283,159 @@ class MainWindow(QMainWindow):
 
     def _create_empty_subproject(self, name: str = "Sub-Projekt 1") -> Project:
         unit = self._unit_combo.currentData() if hasattr(self, "_unit_combo") else UnitSystem.KG_M
-        return Project(name=name, truss_type_id=0, unit_system=unit)
+        system = self._create_empty_system("System 1", 0)
+        project = Project(
+            name=name,
+            truss_type_id=0,
+            unit_system=unit,
+            systems=[system],
+            active_system_id=system.id,
+            plan_system_id=system.id,
+            compare_system_ids=[],
+        )
+        self._sync_project_to_active_system(project)
+        return project
+
+    def _create_empty_system(self, name: str, idx: int = 0) -> TrussSystem:
+        return TrussSystem(
+            id=str(uuid.uuid4()),
+            name=name,
+            canvas_x_m=0.0,
+            canvas_y_m=float(idx),
+        )
+
+    def _ensure_project_systems(self, project: Project) -> None:
+        if not project.systems:
+            system = TrussSystem(
+                id=str(uuid.uuid4()),
+                name="System 1",
+                truss_type_id=project.truss_type_id,
+                sections=project.sections,
+                supports=project.supports,
+                point_loads=project.point_loads,
+                distributed_loads=project.distributed_loads,
+            )
+            project.systems = [system]
+            project.active_system_id = system.id
+        needs_layout = (
+            len(project.systems) > 1
+            and all(abs(float(system.canvas_y_m)) < 1e-9 for system in project.systems)
+        )
+        for idx, system in enumerate(project.systems):
+            if not system.id:
+                system.id = str(uuid.uuid4())
+            if not system.name:
+                system.name = f"System {idx + 1}"
+            if needs_layout:
+                system.canvas_y_m = float(idx)
+        if not project.active_system_id or not self._system_by_id(project.active_system_id, project):
+            project.active_system_id = project.systems[0].id
+        if not project.plan_system_id or not self._system_by_id(project.plan_system_id, project):
+            project.plan_system_id = project.active_system_id
+        valid_ids = {system.id for system in project.systems}
+        project.compare_system_ids = [
+            system_id for system_id in project.compare_system_ids if system_id in valid_ids
+        ]
+        self._sync_project_to_active_system(project)
+
+    def _active_system(self) -> Optional[TrussSystem]:
+        if not self._project:
+            return None
+        return self._project.active_system
+
+    def _system_by_id(self, system_id: str, project: Optional[Project] = None) -> Optional[TrussSystem]:
+        project = project or self._project
+        if not project or not system_id:
+            return None
+        for system in project.systems:
+            if system.id == system_id:
+                return system
+        return None
+
+    def _visible_systems_for_project(self, project: Optional[Project] = None) -> list[TrussSystem]:
+        project = project or self._project
+        if not project:
+            return []
+        if project.view_mode == "compare":
+            ids = set(project.compare_system_ids or [])
+            return [system for system in project.systems if not ids or system.id in ids]
+        plan = self._system_by_id(project.plan_system_id, project)
+        return [plan or project.active_system] if (plan or project.active_system) else []
+
+    def _clone_system_for_mode(self, system: TrussSystem, name_suffix: str = "") -> TrussSystem:
+        clone = copy.deepcopy(system)
+        clone.id = str(uuid.uuid4())
+        clone.name = f"{system.name or 'System'}{name_suffix}"
+        clone.canvas_x_m = 0.0
+        clone.canvas_y_m = 0.0
+        for collection in (
+            clone.sections, clone.supports,
+            clone.point_loads, clone.distributed_loads,
+        ):
+            for element in collection:
+                element.id = str(uuid.uuid4())
+        return clone
+
+    def _sync_project_to_active_system(self, project: Optional[Project] = None) -> None:
+        project = project or self._project
+        if not project:
+            return
+        system = project.active_system
+        if system is None:
+            return
+        project.truss_type_id = system.truss_type_id
+        project.sections = system.sections
+        project.supports = system.supports
+        project.point_loads = system.point_loads
+        project.distributed_loads = system.distributed_loads
+
+    def _system_results(self) -> dict[str, CalculationResult]:
+        if not (0 <= self._active_subproject_index < len(self._subproject_results)):
+            return {}
+        return self._subproject_results[self._active_subproject_index]
+
+    def _system_truss_types(self) -> dict[str, TrussType]:
+        if not (0 <= self._active_subproject_index < len(self._subproject_truss_types)):
+            return {}
+        return self._subproject_truss_types[self._active_subproject_index]
+
+    def _set_active_system(self, system_id: str, update_combo: bool = True) -> None:
+        if not self._project or not self._system_by_id(system_id):
+            return
+        self._project.active_system_id = system_id
+        if self._project.view_mode != "compare":
+            self._project.plan_system_id = system_id
+        self._sync_project_to_active_system()
+        self._truss_type = self._truss_for_system(self._active_system())
+        self._last_result = self._system_results().get(system_id)
+        if update_combo:
+            idx = self._system_combo.findData(system_id)
+            if idx >= 0 and self._system_combo.currentIndex() != idx:
+                self._system_combo.blockSignals(True)
+                self._system_combo.setCurrentIndex(idx)
+                self._system_combo.blockSignals(False)
+        self._refresh_active_system_ui()
+
+    def _truss_for_system(self, system: Optional[TrussSystem]) -> Optional[TrussType]:
+        if not system or not system.truss_type_id:
+            return None
+        cache = self._system_truss_types()
+        if system.id in cache:
+            return cache[system.id]
+        from trusscalc.database.db_manager import load_truss_type
+        truss = load_truss_type(system.truss_type_id)
+        if truss:
+            cache[system.id] = truss
+        return truss
 
     def _load_project_bundle(self, bundle: ProjectBundle) -> None:
         if not bundle.subprojects:
             bundle.subprojects.append(self._create_empty_subproject())
+        for project in bundle.subprojects:
+            self._ensure_project_systems(project)
         self._project_bundle = bundle
-        self._subproject_truss_types = [None for _ in bundle.subprojects]
-        self._subproject_results = [None for _ in bundle.subprojects]
+        self._subproject_truss_types = [{} for _ in bundle.subprojects]
+        self._subproject_results = [{} for _ in bundle.subprojects]
         self._subproject_undo_stacks = [[] for _ in bundle.subprojects]
         self._subproject_redo_stacks = [[] for _ in bundle.subprojects]
         self._active_subproject_index = 0
@@ -275,14 +451,62 @@ class MainWindow(QMainWindow):
             self._tabs.setCurrentIndex(self._active_subproject_index)
         self._updating_tabs = False
 
+    def _refresh_system_combo(self) -> None:
+        self._system_combo.blockSignals(True)
+        self._system_combo.clear()
+        if self._project:
+            self._ensure_project_systems(self._project)
+            for system in self._visible_systems_for_project(self._project):
+                self._system_combo.addItem(system.name or "System", system.id)
+            active_id = self._project.active_system_id
+            idx = self._system_combo.findData(active_id)
+            if idx >= 0:
+                self._system_combo.setCurrentIndex(idx)
+        self._system_combo.blockSignals(False)
+
+    def _refresh_active_system_ui(self) -> None:
+        if not self._project:
+            return
+        system = self._active_system()
+        self._truss_type = self._truss_for_system(system)
+        self._last_result = self._system_results().get(system.id) if system else None
+        self._props.show_project_summary(self._project, self._truss_type)
+        if self._truss_type:
+            self._lbl_truss.setText(
+                f"System: {system.name} | Traversentyp: {self._truss_type.display_name}"
+            )
+        else:
+            self._lbl_truss.setText(f"System: {system.name if system else '-'} | Kein Traversentyp ausgewählt")
+        self._canvas.set_active_system_id(system.id if system else None)
+        self._show_all_results()
+
+    def _show_all_results(self) -> None:
+        if not self._project:
+            return
+        specs = {}
+        for system in self._visible_systems_for_project(self._project):
+            result = self._system_results().get(system.id)
+            truss = self._truss_for_system(system)
+            if not result or not truss:
+                continue
+            interp = LoadTableInterpolator(truss)
+            ei = interp.effective_ei(system.total_length_m)
+            sw = truss.weight_per_meter_kg if truss.has_weight else None
+            specs[system.id] = (result, ei or 1.0, sw)
+        self._canvas.show_system_results(specs)
+
     def _commit_active_subproject_state(self) -> None:
         if not self._project_bundle or self._project is None:
             return
         idx = self._active_subproject_index
         if 0 <= idx < len(self._project_bundle.subprojects):
+            self._sync_project_to_active_system()
             self._project_bundle.subprojects[idx] = self._project
-            self._subproject_truss_types[idx] = self._truss_type
-            self._subproject_results[idx] = self._last_result
+            system = self._active_system()
+            if system and self._truss_type:
+                self._subproject_truss_types[idx][system.id] = self._truss_type
+            if system and self._last_result:
+                self._subproject_results[idx][system.id] = self._last_result
             self._subproject_undo_stacks[idx] = self._undo_stack
             self._subproject_redo_stacks[idx] = self._redo_stack
 
@@ -291,32 +515,29 @@ class MainWindow(QMainWindow):
             return
         self._active_subproject_index = idx
         self._project = self._project_bundle.subprojects[idx]
-        self._truss_type = self._subproject_truss_types[idx]
-        if self._truss_type is None and self._project.truss_type_id:
-            from trusscalc.database.db_manager import load_truss_type
-            self._truss_type = load_truss_type(self._project.truss_type_id)
-            self._subproject_truss_types[idx] = self._truss_type
-        self._last_result = self._subproject_results[idx]
+        self._ensure_project_systems(self._project)
+        self._truss_type = self._truss_for_system(self._active_system())
+        self._last_result = self._system_results().get(self._project.active_system_id)
         self._undo_stack = self._subproject_undo_stacks[idx]
         self._redo_stack = self._subproject_redo_stacks[idx]
+        self._refresh_mode_ui()
         self._canvas.load_project(self._project)
-        self._props.show_project_summary(self._project, self._truss_type)
-        if self._truss_type:
-            self._lbl_truss.setText(f"Traversentyp: {self._truss_type.display_name}")
-        else:
-            self._lbl_truss.setText("Kein Traversentyp ausgewählt")
-        if self._last_result and self._truss_type:
-            interp = LoadTableInterpolator(self._truss_type)
-            ei = interp.effective_ei(self._project.total_length_m)
-            sw = self._truss_type.weight_per_meter_kg if self._truss_type.has_weight else None
-            self._canvas.show_results(self._last_result, ei or 1.0, sw)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
         self._update_window_title()
 
     def _on_tab_changed(self, idx: int) -> None:
         if self._updating_tabs or idx < 0 or idx == self._active_subproject_index:
             return
+        keep_copy_templates = copy.deepcopy(self._copy_templates)
         self._commit_active_subproject_state()
         self._activate_subproject(idx)
+        if keep_copy_templates:
+            self._copy_templates = keep_copy_templates
+            self._canvas.begin_copy_mode(self._copy_templates)
+            self._status.showMessage(
+                "Kopie bereit - Linksklick platziert im aktiven Tab, Rechtsklick/Esc bricht ab"
+            )
 
     def _on_tab_moved(self, from_idx: int, to_idx: int) -> None:
         if (
@@ -350,6 +571,119 @@ class MainWindow(QMainWindow):
         self._activate_subproject(new_active)
         self._status.showMessage("Sub-Projekt-Reihenfolge aktualisiert")
 
+    def _show_tab_context_menu(self, pos) -> None:
+        tab_idx = self._tabs.tabBar().tabAt(pos)
+        if tab_idx >= 0 and tab_idx != self._tabs.currentIndex():
+            self._tabs.setCurrentIndex(tab_idx)
+        menu = QMenu(self)
+        menu.addAction("Neu", self._add_subproject_tab)
+        menu.addAction("Umbenennen", self._rename_subproject_tab)
+        menu.addAction("Duplizieren", self._duplicate_subproject_tab)
+        delete_action = menu.addAction("Löschen", self._delete_subproject_tab)
+        delete_action.setEnabled(
+            bool(self._project_bundle and len(self._project_bundle.subprojects) > 1)
+        )
+        menu.exec(self._tabs.tabBar().mapToGlobal(pos))
+
+    def _on_view_mode_changed(self, idx: int) -> None:
+        if not self._project:
+            return
+        mode = self._mode_combo.currentData() or "plan"
+        if self._project.view_mode == mode:
+            self._refresh_mode_ui()
+            return
+        if self._copy_templates or self._canvas.is_copy_mode_active():
+            self._copy_templates = []
+            self._canvas.cancel_copy_mode()
+            self._status.showMessage("Kopieren beim Moduswechsel abgebrochen")
+        self._push_undo()
+        old_mode = self._project.view_mode or "plan"
+        if old_mode == "plan" and mode == "compare":
+            self._enter_compare_mode()
+        elif old_mode == "compare" and mode == "plan":
+            if not self._enter_plan_mode():
+                self._undo_stack.pop()
+                self._refresh_mode_ui()
+                return
+        self._project.view_mode = mode
+        self._commit_active_subproject_state()
+        self._refresh_mode_ui()
+        self._canvas.load_project(self._project)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
+        self._show_all_results()
+
+    def _enter_compare_mode(self) -> None:
+        if not self._project:
+            return
+        plan = self._system_by_id(self._project.plan_system_id) or self._project.active_system
+        if not self._project.compare_system_ids and plan:
+            clone = self._clone_system_for_mode(plan, " Vergleich")
+            self._project.systems.append(clone)
+            self._project.compare_system_ids = [clone.id]
+            self._project.active_system_id = clone.id
+        elif self._project.compare_system_ids:
+            self._project.active_system_id = self._project.compare_system_ids[0]
+
+    def _enter_plan_mode(self) -> bool:
+        if not self._project:
+            return True
+        existing_plan = self._system_by_id(self._project.plan_system_id)
+        compare_systems = [
+            system for system in self._project.systems
+            if system.id in set(self._project.compare_system_ids or [])
+        ]
+        if not compare_systems:
+            if existing_plan:
+                self._project.active_system_id = existing_plan.id
+            return True
+        if existing_plan:
+            reply = QMessageBox.question(
+                self,
+                "Planen",
+                "Das Planen-System beibehalten?\n\n"
+                "Ja = vorhandenes Planen-System behalten\n"
+                "Nein = System aus Vergleichen importieren",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return False
+            if reply == QMessageBox.StandardButton.Yes:
+                self._project.active_system_id = existing_plan.id
+                return True
+        names = [system.name or f"System {idx + 1}" for idx, system in enumerate(compare_systems)]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "System uebernehmen",
+            "Welches System soll in Planen uebernommen werden?",
+            names,
+            0,
+            False,
+        )
+        if not ok:
+            return False
+        source = compare_systems[names.index(selected)]
+        clone = self._clone_system_for_mode(source)
+        clone.name = source.name or "System"
+        self._project.systems.append(clone)
+        self._project.plan_system_id = clone.id
+        self._project.active_system_id = clone.id
+        return True
+
+    def _refresh_mode_ui(self) -> None:
+        if not self._project:
+            return
+        mode = self._project.view_mode or "plan"
+        idx = self._mode_combo.findData(mode)
+        self._mode_combo.blockSignals(True)
+        self._mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._mode_combo.blockSignals(False)
+        is_compare = mode == "compare"
+        self._system_bar.setVisible(is_compare)
+        self._canvas.set_comparison_mode(is_compare)
+
     def _add_subproject_tab(self) -> None:
         if not self._project_bundle:
             self._new_project()
@@ -357,8 +691,8 @@ class MainWindow(QMainWindow):
         project = self._create_empty_subproject(name)
         self._commit_active_subproject_state()
         self._project_bundle.subprojects.append(project)
-        self._subproject_truss_types.append(None)
-        self._subproject_results.append(None)
+        self._subproject_truss_types.append({})
+        self._subproject_results.append({})
         self._subproject_undo_stacks.append([])
         self._subproject_redo_stacks.append([])
         self._active_subproject_index = len(self._project_bundle.subprojects) - 1
@@ -386,10 +720,17 @@ class MainWindow(QMainWindow):
         clone = copy.deepcopy(self._project)
         clone.name = f"{self._project.name or 'Sub-Projekt'} Kopie"
         self._regenerate_element_ids(clone)
+        if clone.view_mode != "compare":
+            plan = self._system_by_id(clone.plan_system_id, clone) or clone.active_system
+            if plan:
+                clone.systems = [plan]
+                clone.plan_system_id = plan.id
+                clone.active_system_id = plan.id
+                clone.compare_system_ids = []
         idx = self._active_subproject_index + 1
         self._project_bundle.subprojects.insert(idx, clone)
-        self._subproject_truss_types.insert(idx, copy.deepcopy(self._truss_type))
-        self._subproject_results.insert(idx, None)
+        self._subproject_truss_types.insert(idx, {})
+        self._subproject_results.insert(idx, {})
         self._subproject_undo_stacks.insert(idx, [])
         self._subproject_redo_stacks.insert(idx, [])
         self._active_subproject_index = idx
@@ -417,14 +758,144 @@ class MainWindow(QMainWindow):
         self._refresh_tabs()
         self._activate_subproject(self._active_subproject_index)
 
-    @staticmethod
-    def _regenerate_element_ids(project: Project) -> None:
+    def _on_system_changed(self, idx: int) -> None:
+        if idx < 0:
+            return
+        system_id = self._system_combo.itemData(idx)
+        if system_id:
+            self._set_active_system(system_id, update_combo=False)
+
+    def _on_canvas_system_selected(self, system_id: str) -> None:
+        self._set_active_system(system_id)
+
+    def _add_system(self) -> None:
+        if not self._project:
+            return
+        self._push_undo()
+        idx = len(self._project.systems)
+        system = self._create_empty_system(f"System {idx + 1}", idx)
+        self._project.systems.append(system)
+        if self._project.view_mode == "compare":
+            self._project.compare_system_ids.append(system.id)
+        else:
+            self._project.plan_system_id = system.id
+        self._project.active_system_id = system.id
+        self._sync_project_to_active_system()
+        self._clear_system_result(system.id)
+        self._canvas.load_project(self._project)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
+        self._status.showMessage(f"System angelegt: {system.name}")
+
+    def _rename_system(self) -> None:
+        system = self._active_system()
+        if not system:
+            return
+        name, ok = QInputDialog.getText(
+            self, "System umbenennen", "Name:", text=system.name or "System"
+        )
+        if not ok or not name.strip():
+            return
+        system.name = name.strip()
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
+
+    def _duplicate_system(self) -> None:
+        if not self._project:
+            return
+        system = self._active_system()
+        if not system:
+            return
+        self._push_undo()
+        clone = copy.deepcopy(system)
+        clone.id = str(uuid.uuid4())
+        clone.name = f"{system.name or 'System'} Kopie"
+        clone.canvas_y_m = float(len(self._project.systems))
         for collection in (
-            project.sections, project.supports,
-            project.point_loads, project.distributed_loads,
+            clone.sections, clone.supports,
+            clone.point_loads, clone.distributed_loads,
         ):
             for element in collection:
                 element.id = str(uuid.uuid4())
+        self._project.systems.append(clone)
+        if self._project.view_mode == "compare":
+            self._project.compare_system_ids.append(clone.id)
+        else:
+            self._project.plan_system_id = clone.id
+        self._project.active_system_id = clone.id
+        truss = self._truss_for_system(system)
+        if truss:
+            self._system_truss_types()[clone.id] = copy.deepcopy(truss)
+        self._sync_project_to_active_system()
+        self._canvas.load_project(self._project)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
+
+    def _delete_system(self) -> None:
+        if not self._project or len(self._project.systems) <= 1:
+            QMessageBox.information(self, "System löschen", "Mindestens ein System muss bestehen bleiben.")
+            return
+        system = self._active_system()
+        if not system:
+            return
+        reply = QMessageBox.question(
+            self, "System löschen", f"System '{system.name}' löschen?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._push_undo()
+        self._project.systems = [s for s in self._project.systems if s.id != system.id]
+        self._project.compare_system_ids = [
+            system_id for system_id in self._project.compare_system_ids if system_id != system.id
+        ]
+        if self._project.plan_system_id == system.id:
+            self._project.plan_system_id = self._project.systems[0].id
+        if self._project.view_mode == "compare" and not self._project.compare_system_ids:
+            self._project.compare_system_ids = [
+                self._project.systems[0].id
+            ]
+        self._system_results().pop(system.id, None)
+        self._system_truss_types().pop(system.id, None)
+        for idx, item in enumerate(self._project.systems):
+            item.canvas_y_m = float(idx)
+        self._project.active_system_id = self._project.systems[0].id
+        self._sync_project_to_active_system()
+        self._canvas.load_project(self._project)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
+
+    def _clear_system_result(self, system_id: Optional[str] = None) -> None:
+        system_id = system_id or (self._active_system().id if self._active_system() else None)
+        if not system_id:
+            return
+        self._system_results().pop(system_id, None)
+        if self._last_result and self._active_system() and self._active_system().id == system_id:
+            self._last_result = None
+        self._canvas.clear_results()
+        self._show_all_results()
+
+    @staticmethod
+    def _regenerate_element_ids(project: Project) -> None:
+        id_map = {}
+        for system in project.systems:
+            old_id = system.id
+            system.id = str(uuid.uuid4())
+            if old_id:
+                id_map[old_id] = system.id
+            for collection in (
+                system.sections, system.supports,
+                system.point_loads, system.distributed_loads,
+            ):
+                for element in collection:
+                    element.id = str(uuid.uuid4())
+        project.active_system_id = id_map.get(project.active_system_id) or (
+            project.systems[0].id if project.systems else None
+        )
+        project.plan_system_id = id_map.get(project.plan_system_id) or project.active_system_id
+        project.compare_system_ids = [
+            id_map[system_id] for system_id in project.compare_system_ids if system_id in id_map
+        ]
 
     # ── Projekt-Verwaltung ────────────────────────────────────────────────────
 
@@ -435,8 +906,8 @@ class MainWindow(QMainWindow):
             unit_system=self._unit_combo.currentData(),
             subprojects=[first],
         )
-        self._subproject_truss_types = [None]
-        self._subproject_results = [None]
+        self._subproject_truss_types = [{}]
+        self._subproject_results = [{}]
         self._subproject_undo_stacks = [[]]
         self._subproject_redo_stacks = [[]]
         self._active_subproject_index = 0
@@ -448,16 +919,25 @@ class MainWindow(QMainWindow):
     def _use_truss_type(self, truss: TrussType) -> None:
         if not self._project_bundle:
             self._new_project()
-        if self._project and self._project.truss_type_id not in (0, truss.id):
+        if self._project is None:
+            self._project = self._create_empty_subproject()
+        self._ensure_project_systems(self._project)
+        system = self._active_system()
+        if system is None:
+            system = self._create_empty_system("System 1", 0)
+            self._project.systems.append(system)
+            self._project.active_system_id = system.id
+        if system.truss_type_id not in (0, truss.id):
             reply = QMessageBox.question(
                 self, "Traversentyp wechseln",
-                "Das aktuelle Sub-Projekt hat bereits einen anderen Traversentyp. "
-                "Neues Sub-Projekt anlegen?",
+                "Das aktuelle System hat bereits einen anderen Traversentyp. "
+                "Neues System anlegen?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.No:
                 return
-            self._add_subproject_tab()
+            self._add_system()
+            system = self._active_system()
 
         if not truss.has_weight:
             QMessageBox.warning(
@@ -467,18 +947,20 @@ class MainWindow(QMainWindow):
             )
 
         self._truss_type = truss
-        if self._project is None:
-            self._project = self._create_empty_subproject()
-        self._project.truss_type_id = truss.id
+        system.truss_type_id = truss.id
         self._project.unit_system = self._unit_combo.currentData()
         if not self._project.name:
             self._project.name = f"Sub-Projekt {self._active_subproject_index + 1}"
+        self._system_truss_types()[system.id] = truss
+        self._sync_project_to_active_system()
         self._commit_active_subproject_state()
         self._canvas.load_project(self._project)
-        self._props.show_project_summary(self._project, self._truss_type)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
         self._refresh_tabs()
-        self._lbl_truss.setText(f"Traversentyp: {truss.display_name}")
-        self._status.showMessage(f"Traversentyp '{truss.display_name}' ausgewählt – Abschnitte und Auflager hinzufügen")
+        self._status.showMessage(
+            f"Traversentyp '{truss.display_name}' für System '{system.name}' ausgewählt"
+        )
 
     def _open_project(self) -> None:
         from trusscalc.database.db_manager import load_project_from_file
@@ -699,15 +1181,19 @@ class MainWindow(QMainWindow):
     def _on_element_deleted(self, element) -> None:
         if not self._project:
             return
+        system = self._active_system()
+        if not system:
+            return
         self._push_undo()
         if isinstance(element, Support):
-            self._project.supports = [s for s in self._project.supports if s.id != element.id]
+            system.supports = [s for s in system.supports if s.id != element.id]
         elif isinstance(element, PointLoad):
-            self._project.point_loads = [p for p in self._project.point_loads if p.id != element.id]
+            system.point_loads = [p for p in system.point_loads if p.id != element.id]
         elif isinstance(element, DistributedLoad):
-            self._project.distributed_loads = [d for d in self._project.distributed_loads if d.id != element.id]
+            system.distributed_loads = [d for d in system.distributed_loads if d.id != element.id]
         elif isinstance(element, TrussSection):
-            self._project.sections = [s for s in self._project.sections if s.id != element.id]
+            system.sections = [s for s in system.sections if s.id != element.id]
+        self._sync_project_to_active_system()
         self._clear_results()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
@@ -787,6 +1273,11 @@ class MainWindow(QMainWindow):
         if not self._project or not self._copy_templates:
             self._canvas.finish_copy_placement()
             return
+        system = self._active_system()
+        if system and not (
+            system.sections or system.supports or system.point_loads or system.distributed_loads
+        ):
+            anchor_m = 0.0
         clones = self._clones_at_anchor(self._copy_templates, anchor_m)
         if not clones:
             self._canvas.finish_copy_placement()
@@ -839,6 +1330,9 @@ class MainWindow(QMainWindow):
     def _delete_selected(self) -> None:
         if not self._project:
             return
+        system = self._active_system()
+        if not system:
+            return
         selected = self._canvas.selected_elements()
         if not selected:
             return
@@ -846,10 +1340,11 @@ class MainWindow(QMainWindow):
         if not ids:
             return
         self._push_undo()
-        self._project.sections = [s for s in self._project.sections if s.id not in ids]
-        self._project.supports = [s for s in self._project.supports if s.id not in ids]
-        self._project.point_loads = [p for p in self._project.point_loads if p.id not in ids]
-        self._project.distributed_loads = [d for d in self._project.distributed_loads if d.id not in ids]
+        system.sections = [s for s in system.sections if s.id not in ids]
+        system.supports = [s for s in system.supports if s.id not in ids]
+        system.point_loads = [p for p in system.point_loads if p.id not in ids]
+        system.distributed_loads = [d for d in system.distributed_loads if d.id not in ids]
+        self._sync_project_to_active_system()
         self._clear_results()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
@@ -886,14 +1381,19 @@ class MainWindow(QMainWindow):
         return clones
 
     def _append_project_element(self, element) -> None:
+        system = self._active_system()
+        if not system:
+            return
         if isinstance(element, TrussSection):
-            self._project.sections.append(element)
+            element.truss_type_id = system.truss_type_id or element.truss_type_id
+            system.sections.append(element)
         elif isinstance(element, Support):
-            self._project.supports.append(element)
+            system.supports.append(element)
         elif isinstance(element, PointLoad):
-            self._project.point_loads.append(element)
+            system.point_loads.append(element)
         elif isinstance(element, DistributedLoad):
-            self._project.distributed_loads.append(element)
+            system.distributed_loads.append(element)
+        self._sync_project_to_active_system()
 
     @staticmethod
     def _element_start_m(element) -> float:
@@ -919,10 +1419,13 @@ class MainWindow(QMainWindow):
         if self._project:
             self._redo_stack.append(copy.deepcopy(self._project))
         self._project = self._undo_stack.pop()
+        self._ensure_project_systems(self._project)
         self._last_result = None
+        self._system_results().clear()
         self._commit_active_subproject_state()
         self._canvas.load_project(self._project)
-        self._props.show_project_summary(self._project, self._truss_type)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
         self._update_window_title()
         self._status.showMessage("Letzte Aenderung rueckgaengig gemacht")
 
@@ -933,10 +1436,13 @@ class MainWindow(QMainWindow):
         if self._project:
             self._undo_stack.append(copy.deepcopy(self._project))
         self._project = self._redo_stack.pop()
+        self._ensure_project_systems(self._project)
         self._last_result = None
+        self._system_results().clear()
         self._commit_active_subproject_state()
         self._canvas.load_project(self._project)
-        self._props.show_project_summary(self._project, self._truss_type)
+        self._refresh_system_combo()
+        self._refresh_active_system_ui()
         self._update_window_title()
         self._status.showMessage("Aenderung wiederholt")
 
@@ -949,14 +1455,22 @@ class MainWindow(QMainWindow):
             self._undo_stack.pop(0)
 
     def _run_calculation(self) -> None:
-        if not self._project or not self._truss_type:
-            QMessageBox.warning(self, "Berechnung", "Bitte zuerst Traversentyp und Projekt einrichten.")
+        if not self._project:
+            QMessageBox.warning(self, "Berechnung", "Bitte zuerst ein Projekt einrichten.")
             return
-        if not self._project.sections:
-            QMessageBox.warning(self, "Berechnung", "Bitte mindestens einen Traversenabschnitt hinzufügen.")
-            return
-        if not self._project.supports:
-            QMessageBox.warning(self, "Berechnung", "Bitte mindestens ein Auflager setzen.")
+        valid_systems = []
+        missing = []
+        for system in self._visible_systems_for_project(self._project):
+            truss = self._truss_for_system(system)
+            if truss and system.sections and system.supports:
+                valid_systems.append((system, truss))
+            else:
+                missing.append(system.name or "System")
+        if not valid_systems:
+            QMessageBox.warning(
+                self, "Berechnung",
+                "Bitte mindestens ein System mit Traversentyp, Abschnitt und Auflager einrichten.",
+            )
             return
 
         progress = QProgressDialog("Berechnung laeuft ...", None, 0, 0, self)
@@ -968,8 +1482,16 @@ class MainWindow(QMainWindow):
         progress.show()
         QApplication.processEvents()
 
+        warnings = []
+        results = self._system_results()
         try:
-            result = calculator.calculate(self._project, self._truss_type)
+            for system, truss in valid_systems:
+                result = calculator.calculate_system(self._project, system, truss)
+                results[system.id] = result
+                if system.id == self._project.active_system_id:
+                    self._last_result = result
+                if result.warnings:
+                    warnings.extend([f"{system.name}: {w}" for w in result.warnings])
         except Exception as exc:
             progress.close()
             QMessageBox.critical(self, "Berechnungsfehler", str(exc))
@@ -977,32 +1499,35 @@ class MainWindow(QMainWindow):
         finally:
             progress.close()
 
-        self._last_result = result
         self._commit_active_subproject_state()
 
-        if result.warnings:
-            QMessageBox.warning(self, "Berechnungshinweise", "\n".join(result.warnings))
+        if warnings:
+            QMessageBox.warning(self, "Berechnungshinweise", "\n".join(warnings))
 
-        interp = LoadTableInterpolator(self._truss_type)
-        ei = interp.effective_ei(self._project.total_length_m)
-        sw = self._truss_type.weight_per_meter_kg if self._truss_type.has_weight else None
-
-        self._canvas.show_results(result, ei or 1.0, sw)
-
-        total = result.total_load_kg + result.self_weight_kg
+        self._show_all_results()
+        skipped = f", {len(missing)} übersprungen" if missing else ""
         self._status.showMessage(
-            f"Berechnung abgeschlossen – "
-            f"Gesamtlast: {total:.1f} kg, "
-            f"Max. Durchbiegung: {result.deflection.max_deflection_mm:.1f} mm"
+            f"Berechnung abgeschlossen: {len(valid_systems)} System(e){skipped}"
         )
 
     def _clear_results(self) -> None:
-        self._last_result = None
+        system = self._active_system()
+        self._clear_system_result(system.id if system else None)
         self._commit_active_subproject_state()
+
+    def _clear_all_results_in_tab(self) -> None:
+        self._last_result = None
+        self._system_results().clear()
         self._canvas.clear_results()
+        self._show_all_results()
+        self._commit_active_subproject_state()
+        self._status.showMessage("Alle Ergebnisse im aktuellen Tab geloescht")
 
     def _fit_view(self) -> None:
-        self._canvas.fit_view()
+        self._canvas.fit_view(all_systems=False)
+
+    def _fit_all_view(self) -> None:
+        self._canvas.fit_view(all_systems=True)
 
     # ── Einheiten ─────────────────────────────────────────────────────────────
 
@@ -1017,12 +1542,8 @@ class MainWindow(QMainWindow):
         self._props.set_unit_system(unit)
         if self._project:
             self._canvas.load_project(self._project)
-            if self._last_result and self._truss_type:
-                interp = LoadTableInterpolator(self._truss_type)
-                ei = interp.effective_ei(self._project.total_length_m)
-                sw = self._truss_type.weight_per_meter_kg if self._truss_type.has_weight else None
-                self._canvas.show_results(self._last_result, ei or 1.0, sw)
-            self._props.show_project_summary(self._project, self._truss_type)
+            self._show_all_results()
+            self._refresh_active_system_ui()
 
     # ── PDF-Import & Traversenverwaltung ──────────────────────────────────────
 
@@ -1245,25 +1766,61 @@ class MainWindow(QMainWindow):
             return
         self._commit_active_subproject_state()
 
+        export_label, ok = QInputDialog.getItem(
+            self,
+            "PDF-Modus",
+            "Welcher Modus soll gedruckt werden?",
+            ["Planen", "Vergleichen"],
+            0 if (self._project and self._project.view_mode != "compare") else 1,
+            False,
+        )
+        if not ok:
+            return
+        export_mode = "compare" if export_label == "Vergleichen" else "plan"
+
         chapters = []
         missing = []
         for idx, project in enumerate(self._project_bundle.subprojects):
-            truss_type = self._subproject_truss_types[idx]
-            if truss_type is None and project.truss_type_id:
-                from trusscalc.database.db_manager import load_truss_type
-                truss_type = load_truss_type(project.truss_type_id)
-                self._subproject_truss_types[idx] = truss_type
-            result = self._subproject_results[idx]
-            if result is None and truss_type and project.sections and project.supports:
-                try:
-                    result = calculator.calculate(project, truss_type)
-                    self._subproject_results[idx] = result
-                except Exception:
-                    result = None
-            if truss_type and result:
-                chapters.append((idx, project, truss_type, result))
+            self._ensure_project_systems(project)
+            if export_mode == "compare":
+                ids = set(project.compare_system_ids or [])
+                systems = [system for system in project.systems if not ids or system.id in ids]
             else:
-                missing.append(project.name or f"Sub-Projekt {idx + 1}")
+                plan_system = self._system_by_id(project.plan_system_id, project) or project.active_system
+                systems = [plan_system] if plan_system else []
+            for system in systems:
+                truss_type = self._subproject_truss_types[idx].get(system.id)
+                if truss_type is None:
+                    truss_type = self._truss_for_system(system) if project is self._project else None
+                if truss_type is None and system.truss_type_id:
+                    from trusscalc.database.db_manager import load_truss_type
+                    truss_type = load_truss_type(system.truss_type_id)
+                    if truss_type:
+                        self._subproject_truss_types[idx][system.id] = truss_type
+                result = self._subproject_results[idx].get(system.id)
+                if result is None and truss_type and system.sections and system.supports:
+                    try:
+                        result = calculator.calculate_system(project, system, truss_type)
+                        self._subproject_results[idx][system.id] = result
+                    except Exception:
+                        result = None
+                if truss_type and result:
+                    report_project = calculator.project_from_system(project, system, truss_type)
+                    report_project.name = (
+                        f"{project.name} / {system.name}"
+                        if export_mode == "compare" else project.name
+                    )
+                    chapters.append((
+                        idx, report_project, truss_type, result,
+                        project.name,
+                        system.name if export_mode == "compare" else "",
+                        export_mode,
+                    ))
+                else:
+                    missing.append(
+                        f"{project.name or f'Sub-Projekt {idx + 1}'}"
+                        + (f" / {system.name}" if export_mode == "compare" else "")
+                    )
 
         if missing:
             if chapters:
@@ -1317,12 +1874,15 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         from trusscalc.database.db_manager import load_truss_pdf
         report_chapters = []
-        for _idx, project, truss_type, result in chapters:
+        for _idx, project, truss_type, result, sub_name, system_name, view_mode in chapters:
             report_chapters.append({
                 "project": copy.deepcopy(project),
                 "truss_type": copy.deepcopy(truss_type),
                 "result": copy.deepcopy(result),
                 "datasheet_pdf_bytes": load_truss_pdf(truss_type.id),
+                "sub_project_name": sub_name,
+                "system_name": system_name,
+                "view_mode": view_mode,
             })
 
         class _PdfWorker(QThread):
@@ -1464,6 +2024,14 @@ class MainWindow(QMainWindow):
             return
         if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_M:
             self._mirror_selected()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Space:
+            self._fit_view()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Space:
+            self._fit_all_view()
             event.accept()
             return
         if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Escape:

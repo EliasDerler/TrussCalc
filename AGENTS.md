@@ -57,7 +57,7 @@ Key dataclasses: `TrussType`, `LoadTableEntry`, `TrussSection`, `Support`, `Poin
 
 `Project.total_length_m` is a computed property (sum of section lengths). `Support.has_max_force` guards utilization calculations.
 
-`ProjectBundle` is the current multi-tab project container. Each `Project` inside `ProjectBundle.subprojects` is one independent Sub-Projekt with its own truss type, geometry, loads, undo/redo stack, and calculation result. Treat the active tab as a sub-project editor; do not reintroduce global single-project assumptions in UI, persistence, or PDF code.
+`ProjectBundle` is the current multi-tab project container. Each `Project` inside `ProjectBundle.subprojects` is one Sub-Projekt. A Sub-Projekt can contain multiple independent `TrussSystem` entries; each system has its own truss type, geometry, loads, and calculation result. `Project.view_mode` is `"plan"` or `"compare"`: Planen shows `plan_system_id` only, Vergleichen shows `compare_system_ids` and allows visual X/Y system placement. Switching Planen→Vergleichen copies the plan system into the comparison set; switching back can keep the existing plan system or import a copied comparison system. Treat the active tab as a sub-project editor and the active system as the editing target; do not reintroduce global single-project assumptions in UI, persistence, or PDF code.
 
 ### Database (`database/db_manager.py`)
 
@@ -77,8 +77,8 @@ SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCA
 
 ### Project Persistence
 
-- `.tcproj` files are format version `2` and contain a top-level `ProjectBundle` with `data.subprojects[]`.
-- Legacy files without `subprojects` are automatically migrated to one Sub-Projekt by `load_project_from_file()`.
+- `.tcproj` files are format version `3` and contain `data.subprojects[].systems[]`.
+- Legacy files without `subprojects` or without `systems` are automatically migrated by `load_project_from_file()`.
 - Always call `_commit_active_subproject_state()` before saving, exporting PDF, or switching away from the active tab.
 - `save_project()` / `load_project()` in `database/db_manager.py` use the same JSON structure as `.tcproj`.
 
@@ -89,6 +89,8 @@ SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCA
 - Right-click and `Esc` cancel only the active placement preview; the stored copy template remains available.
 - `Ctrl+M` copies and mirrors the current selection around the active Sub-Projekt's total truss length.
 - Sub-Projekt tabs are movable by drag & drop. When handling tab order, reorder `ProjectBundle.subprojects` and all parallel arrays (`_subproject_truss_types`, `_subproject_results`, `_subproject_undo_stacks`, `_subproject_redo_stacks`) together.
+- Multiple systems inside one tab are statically independent. Planen displays only `plan_system_id`; Vergleichen displays `compare_system_ids`, keeps stored `canvas_x_m`/`canvas_y_m` offsets, and marks PDF chapters with `Vergleich` below the Sub-Projekt/System name. Copy/mirror/delete operate on the active system only.
+- Use `calculator.project_from_system()` when an existing single-system path such as FEM or PDF needs a classic `Project` view.
 
 ### Color Rules (`core/color_rules.py`)
 

@@ -2,12 +2,38 @@
 from typing import Optional
 
 from trusscalc.core.models import (
-    TrussType, Project, CalculationResult, SupportResult, DeflectionResult,
-    LoadType,
+    TrussType, Project, TrussSystem, CalculationResult, SupportResult,
+    DeflectionResult, LoadType,
 )
 from trusscalc.core.interpolator import LoadTableInterpolator
 from trusscalc.core import fem_solver
 from trusscalc.core import color_rules
+
+
+def project_from_system(
+    subproject: Project,
+    system: TrussSystem,
+    truss_type: TrussType | None = None,
+) -> Project:
+    """Erstellt eine klassische Project-Ansicht fuer Berechnung/PDF."""
+    return Project(
+        name=system.name or subproject.name,
+        truss_type_id=system.truss_type_id or (truss_type.id if truss_type else 0),
+        sections=system.sections,
+        supports=system.supports,
+        point_loads=system.point_loads,
+        distributed_loads=system.distributed_loads,
+        unit_system=subproject.unit_system,
+        description=subproject.description,
+    )
+
+
+def calculate_system(
+    subproject: Project,
+    system: TrussSystem,
+    truss_type: TrussType,
+) -> CalculationResult:
+    return calculate(project_from_system(subproject, system, truss_type), truss_type)
 
 
 def _detect_load_pattern(project: Project) -> Optional[LoadType]:

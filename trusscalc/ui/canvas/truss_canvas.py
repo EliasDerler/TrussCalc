@@ -7,19 +7,19 @@ import copy
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QGraphicsItem,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsTextItem,
 )
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
-from PyQt6.QtGui import QPen, QBrush, QColor, QWheelEvent, QMouseEvent, QPainter
+from PyQt6.QtGui import QPen, QBrush, QColor, QWheelEvent, QMouseEvent, QPainter, QFont
 
 from trusscalc.core.models import (
-    TrussSection, Support, PointLoad, DistributedLoad,
+    TrussSystem, TrussSection, Support, PointLoad, DistributedLoad,
     CalculationResult, Project, UnitSystem,
 )
 from trusscalc.ui.canvas.canvas_items import (
     TrussSegmentItem, SupportItem, PointLoadItem, DistributedLoadItem,
     DeflectionCurveItem, DimensionItem, PX_PER_M, TRUSS_HEIGHT,
-    COLOR_DIM_TOTAL, COLOR_DIM_SUPPORT,
+    COLOR_DIM_TOTAL, COLOR_DIM_SUPPORT, COLOR_DIM_TEXT,
     DIM_Y_SUPPORT, DIM_Y_TOTAL,
 )
 from trusscalc.ui.canvas.canvas_tools import CanvasTool
@@ -28,12 +28,14 @@ from trusscalc.core import color_rules
 GRID_SIZE = 20      # Rastergröße in Pixel
 GRID_COLOR = QColor("#2A2A2A")
 BG_COLOR = QColor("#1E1E1E")     # Dunkler LTSpice-Hintergrund
+SYSTEM_ROW_GAP = 260.0
 
 
 class TrussCanvas(QGraphicsView):
     """Hauptcanvas für die Traversenvisualisierung."""
 
     element_selected = pyqtSignal(object)   # Selektiertes Element (Support/Load/Section)
+    system_selected = pyqtSignal(str)
     element_added = pyqtSignal(object)
     element_deleted = pyqtSignal(object)
     element_context_requested = pyqtSignal(object)
@@ -54,6 +56,7 @@ class TrussCanvas(QGraphicsView):
         super().__init__(scene, parent)
         self._setup_view()
         self._project: Optional[Project] = None
+        self._active_system_id: Optional[str] = None
         self._current_tool = CanvasTool.SELECT
         self._dist_load_start: Optional[float] = None
         self._panning = False
@@ -62,13 +65,18 @@ class TrussCanvas(QGraphicsView):
         self._copy_templates: list = []
         self._copy_anchor_m = 0.0
         self._copy_preview_items: list[QGraphicsItem] = []
+        self._comparison_mode = False
+        self._system_drag_id: Optional[str] = None
+        self._system_drag_last_scene: Optional[QPointF] = None
 
         # Canvas-Items (Position_id → Item)
         self._section_items: dict[str, TrussSegmentItem] = {}
         self._support_items: dict[str, SupportItem] = {}
         self._load_items: dict[str, PointLoadItem | DistributedLoadItem] = {}
         self._deflection_item: Optional[DeflectionCurveItem] = None
+        self._deflection_items: dict[str, DeflectionCurveItem] = {}
         self._dim_items: list[DimensionItem] = []
+        self._element_system_ids: dict[str, str] = {}
 
     def _setup_view(self) -> None:
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -79,6 +87,7 @@ class TrussCanvas(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.scene().setSceneRect(-500, -350, 3000, 700)
+        self.setStyleSheet("")
 
     # ── Werkzeug-API ──────────────────────────────────────────────────────────
 
@@ -95,8 +104,24 @@ class TrussCanvas(QGraphicsView):
     # ── Projekt laden ─────────────────────────────────────────────────────────
 
     def load_project(self, project: Project) -> None:
-        self.cancel_copy_mode()
+        self.finish_copy_placement()
         self._project = project
+        if self._project and self._project.active_system:
+            self._active_system_id = self._project.active_system.id
+        self._rebuild_scene()
+
+    def set_active_system_id(self, system_id: Optional[str]) -> None:
+        self._active_system_id = system_id
+        if self._project and self._project.active_system_id != system_id:
+            self._project.active_system_id = system_id
+        if self._project and not self._comparison_mode:
+            self._rebuild_scene()
+
+    def set_comparison_mode(self, enabled: bool) -> None:
+        self._comparison_mode = enabled
+        self.setStyleSheet(
+            "QGraphicsView { border: 2px solid #00A6A6; }" if enabled else ""
+        )
         self._rebuild_scene()
 
     def _force_text(self, kg: float) -> str:
@@ -110,53 +135,123 @@ class TrussCanvas(QGraphicsView):
         self._support_items.clear()
         self._load_items.clear()
         self._deflection_item = None
+        self._deflection_items.clear()
         self._dim_items.clear()
+        self._element_system_ids.clear()
 
         if not self._project:
             return
 
-        for section in self._project.sections:
-            self._add_section_item(section)
+        systems = self._visible_systems()
+        for idx, system in enumerate([s for s in systems if s is not None]):
+            y = self._system_y(system)
+            x = self._system_x(system)
+            if self._comparison_mode and len(systems) > 1:
+                self._draw_system_label(system, x, y)
+            for section in system.sections:
+                self._add_section_item(section, system)
 
-        for support in self._project.supports:
-            self._add_support_item(support)
+            for support in system.supports:
+                self._add_support_item(support, system)
 
-        for pl in self._project.point_loads:
-            self._add_point_load_item(pl)
+            for pl in system.point_loads:
+                self._add_point_load_item(pl, system)
 
-        for dl in self._project.distributed_loads:
-            self._add_dist_load_item(dl)
+            for dl in system.distributed_loads:
+                self._add_dist_load_item(dl, system)
 
         self._draw_dimensions()
+        self._update_scene_rect()
 
     # ── Element hinzufügen ────────────────────────────────────────────────────
 
-    def _add_section_item(self, section: TrussSection) -> TrussSegmentItem:
+    def _system_y(self, system: TrussSystem) -> float:
+        return float(system.canvas_y_m) * SYSTEM_ROW_GAP
+
+    def _system_x(self, system: TrussSystem) -> float:
+        return float(system.canvas_x_m) * PX_PER_M
+
+    def _visible_systems(self) -> list[TrussSystem]:
+        if not self._project:
+            return []
+        systems = [s for s in self._project.systems if s is not None]
+        if self._comparison_mode:
+            ids = set(getattr(self._project, "compare_system_ids", []) or [])
+            return [s for s in systems if not ids or s.id in ids]
+        plan_id = getattr(self._project, "plan_system_id", None)
+        active = next((s for s in systems if s.id == plan_id), None) or self._project.active_system
+        return [active] if active else systems[:1]
+
+    def _system_at_scene_y(self, scene_y: float) -> Optional[TrussSystem]:
+        systems = self._visible_systems()
+        if not systems:
+            return self._project.active_system if self._project else None
+        return min(
+            systems,
+            key=lambda system: abs(scene_y - self._system_y(system)),
+        )
+
+    def _pos_m_for_scene(self, scene_pos: QPointF, system: Optional[TrussSystem]) -> float:
+        x_offset = self._system_x(system) if system else 0.0
+        return (scene_pos.x() - x_offset) / PX_PER_M
+
+    def _draw_system_label(self, system: TrussSystem, x: float, y: float) -> None:
+        label = QGraphicsTextItem(system.name or "System")
+        font = QFont()
+        font.setPointSize(14)
+        font.setBold(True)
+        label.setFont(font)
+        label.setDefaultTextColor(COLOR_DIM_TEXT)
+        label.setPos(x, y + DIM_Y_TOTAL - 82)
+        label.setData(0, system.id)
+        self.scene().addItem(label)
+
+    def _remember_system(self, element_id: str, system: TrussSystem) -> None:
+        if element_id:
+            self._element_system_ids[element_id] = system.id
+
+    def _add_section_item(self, section: TrussSection, system: TrussSystem | None = None) -> TrussSegmentItem:
         item = TrussSegmentItem(section)
-        item.setPos(section.position_m * PX_PER_M, 0)
+        y = self._system_y(system) if system else 0.0
+        x = self._system_x(system) if system else 0.0
+        item.setPos(x + section.position_m * PX_PER_M, y)
         self.scene().addItem(item)
         self._section_items[section.id] = item
+        if system:
+            self._remember_system(section.id, system)
         return item
 
-    def _add_support_item(self, support: Support) -> SupportItem:
+    def _add_support_item(self, support: Support, system: TrussSystem | None = None) -> SupportItem:
         item = SupportItem(support)
-        item.setPos(support.position_m * PX_PER_M, TRUSS_HEIGHT // 2)
+        y = self._system_y(system) if system else 0.0
+        x = self._system_x(system) if system else 0.0
+        item.setPos(x + support.position_m * PX_PER_M, y + TRUSS_HEIGHT // 2)
         self.scene().addItem(item)
         self._support_items[support.id] = item
+        if system:
+            self._remember_system(support.id, system)
         return item
 
-    def _add_point_load_item(self, load: PointLoad) -> PointLoadItem:
+    def _add_point_load_item(self, load: PointLoad, system: TrussSystem | None = None) -> PointLoadItem:
         item = PointLoadItem(load)
-        item.setPos(load.position_m * PX_PER_M, 0)
+        y = self._system_y(system) if system else 0.0
+        x = self._system_x(system) if system else 0.0
+        item.setPos(x + load.position_m * PX_PER_M, y)
         self.scene().addItem(item)
         self._load_items[load.id] = item
+        if system:
+            self._remember_system(load.id, system)
         return item
 
-    def _add_dist_load_item(self, load: DistributedLoad) -> DistributedLoadItem:
+    def _add_dist_load_item(self, load: DistributedLoad, system: TrussSystem | None = None) -> DistributedLoadItem:
         item = DistributedLoadItem(load)
-        item.setPos(load.start_m * PX_PER_M, 0)
+        y = self._system_y(system) if system else 0.0
+        x = self._system_x(system) if system else 0.0
+        item.setPos(x + load.start_m * PX_PER_M, y)
         self.scene().addItem(item)
         self._load_items[load.id] = item
+        if system:
+            self._remember_system(load.id, system)
         return item
 
     def _draw_dimensions(self) -> None:
@@ -165,34 +260,33 @@ class TrussCanvas(QGraphicsView):
         self._dim_items.clear()
         if not self._project:
             return
+        for system in self._visible_systems():
+            total = system.total_length_m
+            y = self._system_y(system)
+            x_offset = self._system_x(system)
 
-        total = self._project.total_length_m
-
-        # Gesamtlänge: grau, ganz oben
-        if total > 0:
-            item = DimensionItem(0, total * PX_PER_M,
-                                 f"Gesamt: {total*100:.0f} cm",
-                                 DIM_Y_TOTAL, color=COLOR_DIM_TOTAL)
-            self.scene().addItem(item)
-            self._dim_items.append(item)
-
-        # Auflager-Abstände: blau, über den Lasten
-        all_positions = sorted([s.position_m for s in self._project.supports])
-        if all_positions:
-            # Alle Segmente zwischen Auflagern (inkl. Enden wenn kein Auflager dort)
-            segment_points = sorted({0.0, total} | set(all_positions))
-            for i in range(len(segment_points) - 1):
-                x1 = segment_points[i]
-                x2 = segment_points[i + 1]
-                if x2 - x1 < 1e-6:
-                    continue
-                item = DimensionItem(
-                    x1 * PX_PER_M, x2 * PX_PER_M,
-                    f"{(x2 - x1) * 100:.0f} cm",
-                    DIM_Y_SUPPORT, color=COLOR_DIM_SUPPORT,
-                )
+            if total > 0:
+                item = DimensionItem(x_offset, x_offset + total * PX_PER_M,
+                                     f"Gesamt: {total*100:.0f} cm",
+                                     y + DIM_Y_TOTAL, color=COLOR_DIM_TOTAL)
                 self.scene().addItem(item)
                 self._dim_items.append(item)
+
+            all_positions = sorted([s.position_m for s in system.supports])
+            if all_positions:
+                segment_points = sorted({0.0, total} | set(all_positions))
+                for i in range(len(segment_points) - 1):
+                    x1 = segment_points[i]
+                    x2 = segment_points[i + 1]
+                    if x2 - x1 < 1e-6:
+                        continue
+                    item = DimensionItem(
+                        x_offset + x1 * PX_PER_M, x_offset + x2 * PX_PER_M,
+                        f"{(x2 - x1) * 100:.0f} cm",
+                        y + DIM_Y_SUPPORT, color=COLOR_DIM_SUPPORT,
+                    )
+                    self.scene().addItem(item)
+                    self._dim_items.append(item)
 
     # ── Berechnungsergebnisse anzeigen ────────────────────────────────────────
 
@@ -247,10 +341,64 @@ class TrussCanvas(QGraphicsView):
                 )
                 item.update()
 
+    def show_system_results(self, result_specs: dict[str, tuple]) -> None:
+        if not self._project:
+            return
+        self.clear_results()
+        for system in self._visible_systems():
+            spec = result_specs.get(system.id)
+            if not spec:
+                continue
+            result, ei_n_m2, self_weight_kg_per_m = spec
+            defl_color = color_rules.classify_deflection(result.deflection)
+            max_text = (f"↓{result.deflection.max_deflection_mm:.1f} mm"
+                        if result.deflection.max_deflection_mm > 0 else "")
+            max_pos = (result.deflection.max_deflection_position_m
+                       if result.deflection.max_deflection_mm > 0 else None)
+            deflection_item = DeflectionCurveItem()
+            deflection_item.set_result(
+                result.deflection.positions_m,
+                result.deflection.deflections_mm,
+                defl_color.color,
+                max_text,
+                max_position_m=max_pos,
+            )
+            deflection_item.setPos(self._system_x(system), self._system_y(system))
+            self.scene().addItem(deflection_item)
+            self._deflection_items[system.id] = deflection_item
+
+            support_colors = color_rules.classify_supports(
+                result.support_results,
+                result.deflection,
+                system.sections,
+                system.point_loads,
+                system.distributed_loads,
+                ei_n_m2,
+                self_weight_kg_per_m,
+                system.total_length_m,
+            )
+            for sc in support_colors:
+                item = self._support_items.get(sc.support_id)
+                if item:
+                    item.set_color(sc.color)
+                    item.setToolTip(sc.tooltip)
+            for sr in result.support_results:
+                item = self._support_items.get(sr.support.id)
+                if item:
+                    item.reaction_text = self._force_text(sr.reaction_kg)
+                    item.lift_height_mm = (
+                        sr.lift_height_mm if not sr.is_active else 0.0
+                    )
+                    item.update()
+
     def clear_results(self) -> None:
         if self._deflection_item:
             self.scene().removeItem(self._deflection_item)
             self._deflection_item = None
+        for item in self._deflection_items.values():
+            if item.scene() is self.scene():
+                self.scene().removeItem(item)
+        self._deflection_items.clear()
         for item in self._support_items.values():
             item.set_color("white")
             item.reaction_text = ""
@@ -268,7 +416,11 @@ class TrussCanvas(QGraphicsView):
             return
 
         scene_pos = self.mapToScene(event.pos())
-        pos_m = scene_pos.x() / PX_PER_M
+        clicked_system = self._system_label_at(event.pos()) or self._system_at_scene_y(scene_pos.y())
+        if clicked_system:
+            self._active_system_id = clicked_system.id
+            self.system_selected.emit(clicked_system.id)
+        pos_m = self._pos_m_for_scene(scene_pos, clicked_system)
 
         if self._copy_mode:
             if event.button() == Qt.MouseButton.RightButton:
@@ -295,11 +447,28 @@ class TrussCanvas(QGraphicsView):
             return
 
         if self._current_tool == CanvasTool.SELECT:
+            if (
+                self._comparison_mode
+                and event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                and clicked_system
+                and self._element_item_at(event.pos()) is None
+                and self._is_system_drag_hit(event.pos(), scene_pos, clicked_system)
+            ):
+                self._system_drag_id = clicked_system.id
+                self._system_drag_last_scene = scene_pos
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
             super().mousePressEvent(event)
             items = self.scene().selectedItems()
             if items:
                 element = self._element_from_item(items[0])
                 if element is not None:
+                    system_id = self._element_system_ids.get(getattr(element, "id", ""))
+                    if system_id:
+                        self._active_system_id = system_id
+                        self.system_selected.emit(system_id)
                     self.element_selected.emit(element)
             else:
                 self.element_selected.emit(None)
@@ -328,6 +497,12 @@ class TrussCanvas(QGraphicsView):
             self.request_section_dialog.emit(0.0)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._system_drag_id and event.button() == Qt.MouseButton.LeftButton:
+            self._system_drag_id = None
+            self._system_drag_last_scene = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.MiddleButton:
             self._panning = False
             self._pan_last_pos = None
@@ -337,6 +512,32 @@ class TrussCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._system_drag_id
+            and self._system_drag_last_scene is not None
+            and self._project
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            scene_pos = self.mapToScene(event.pos())
+            delta = scene_pos - self._system_drag_last_scene
+            self._system_drag_last_scene = scene_pos
+            system = next((s for s in self._project.systems if s.id == self._system_drag_id), None)
+            if system:
+                old_x = system.canvas_x_m
+                old_y = system.canvas_y_m
+                system.canvas_x_m += delta.x() / PX_PER_M
+                system.canvas_y_m += delta.y() / SYSTEM_ROW_GAP
+                if self._systems_overlap(system):
+                    system.canvas_x_m = old_x
+                    system.canvas_y_m = old_y
+                self._rebuild_scene()
+            event.accept()
+            return
+        if self._system_drag_id:
+            self._system_drag_id = None
+            self._system_drag_last_scene = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
         if self._panning and self._pan_last_pos is not None:
             delta = event.pos() - self._pan_last_pos
             self._pan_last_pos = event.pos()
@@ -350,7 +551,8 @@ class TrussCanvas(QGraphicsView):
             return
         if self._copy_mode:
             scene_pos = self.mapToScene(event.pos())
-            self._update_copy_preview(max(0.0, scene_pos.x() / PX_PER_M))
+            system = self._system_at_scene_y(scene_pos.y())
+            self._update_copy_preview(max(0.0, self._pos_m_for_scene(scene_pos, system)))
         super().mouseMoveEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
@@ -376,6 +578,14 @@ class TrussCanvas(QGraphicsView):
             return
         if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_M:
             self.mirror_requested.emit()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Space:
+            self.fit_view(all_systems=False)
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Space:
+            self.fit_view(all_systems=True)
             event.accept()
             return
         if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Delete:
@@ -410,18 +620,22 @@ class TrussCanvas(QGraphicsView):
     # ── Öffentliche Hilfsmethoden ─────────────────────────────────────────────
 
     def add_section_to_scene(self, section: TrussSection) -> None:
-        self._add_section_item(section)
+        system = self._system_at_scene_y(self._system_y(self._project.active_system)) if self._project and self._project.active_system else None
+        self._add_section_item(section, system)
         self._draw_dimensions()
 
     def add_support_to_scene(self, support: Support) -> None:
-        self._add_support_item(support)
+        system = self._project.active_system if self._project else None
+        self._add_support_item(support, system)
         self._draw_dimensions()
 
     def add_point_load_to_scene(self, load: PointLoad) -> None:
-        self._add_point_load_item(load)
+        system = self._project.active_system if self._project else None
+        self._add_point_load_item(load, system)
 
     def add_dist_load_to_scene(self, load: DistributedLoad) -> None:
-        self._add_dist_load_item(load)
+        system = self._project.active_system if self._project else None
+        self._add_dist_load_item(load, system)
 
     def remove_selected(self) -> None:
         for item in self.scene().selectedItems():
@@ -479,26 +693,36 @@ class TrussCanvas(QGraphicsView):
 
     def _clear_copy_preview(self) -> None:
         for item in self._copy_preview_items:
-            if item.scene() is self.scene():
-                self.scene().removeItem(item)
+            try:
+                if item.scene() is self.scene():
+                    self.scene().removeItem(item)
+            except RuntimeError:
+                pass
         self._copy_preview_items.clear()
 
     def _preview_item_for(self, element):
+        y = 0.0
+        x = 0.0
+        if self._project and self._active_system_id:
+            system = next((s for s in self._project.systems if s.id == self._active_system_id), None)
+            if system:
+                y = self._system_y(system)
+                x = self._system_x(system)
         if isinstance(element, TrussSection):
             item = TrussSegmentItem(element)
-            item.setPos(element.position_m * PX_PER_M, 0)
+            item.setPos(x + element.position_m * PX_PER_M, y)
             return item
         if isinstance(element, Support):
             item = SupportItem(element)
-            item.setPos(element.position_m * PX_PER_M, TRUSS_HEIGHT // 2)
+            item.setPos(x + element.position_m * PX_PER_M, y + TRUSS_HEIGHT // 2)
             return item
         if isinstance(element, PointLoad):
             item = PointLoadItem(element)
-            item.setPos(element.position_m * PX_PER_M, 0)
+            item.setPos(x + element.position_m * PX_PER_M, y)
             return item
         if isinstance(element, DistributedLoad):
             item = DistributedLoadItem(element)
-            item.setPos(element.start_m * PX_PER_M, 0)
+            item.setPos(x + element.start_m * PX_PER_M, y)
             return item
         return None
 
@@ -532,14 +756,37 @@ class TrussCanvas(QGraphicsView):
         for item in self.scene().selectedItems():
             element = self._element_from_item(item)
             if element is not None:
+                system_id = self._element_system_ids.get(getattr(element, "id", ""))
+                if self._active_system_id and system_id and system_id != self._active_system_id:
+                    continue
                 elements.append(element)
         return elements
 
-    def fit_view(self) -> None:
-        if self._project and self._project.total_length_m > 0:
-            rect = QRectF(-50, DIM_Y_TOTAL - 30,
-                          self._project.total_length_m * PX_PER_M + 100,
-                          abs(DIM_Y_TOTAL) + 200)
+    def _update_scene_rect(self) -> None:
+        systems = self._visible_systems()
+        if not systems:
+            self.scene().setSceneRect(-500, -350, 3000, 700)
+            return
+        left = min(self._system_x(s) for s in systems) - 260
+        right = max(self._system_x(s) + max(s.total_length_m, 1.0) * PX_PER_M for s in systems) + 420
+        top = min(self._system_y(s) + DIM_Y_TOTAL - 140 for s in systems)
+        bottom = max(self._system_y(s) + TRUSS_HEIGHT + 240 for s in systems)
+        self.scene().setSceneRect(QRectF(left, top, max(1200, right - left), max(700, bottom - top)))
+
+    def fit_view(self, all_systems: bool = False) -> None:
+        if self._project and self._project.systems:
+            if all_systems:
+                systems = self._visible_systems()
+            else:
+                active = self._project.active_system
+                systems = [active] if active else self._visible_systems()[:1]
+            if not systems:
+                return
+            left = min(self._system_x(s) for s in systems)
+            right = max(self._system_x(s) + max(s.total_length_m, 1.0) * PX_PER_M for s in systems)
+            top = min(self._system_y(s) + DIM_Y_TOTAL - 100 for s in systems)
+            bottom = max(self._system_y(s) + TRUSS_HEIGHT + 170 for s in systems)
+            rect = QRectF(left - 80, top, max(320, right - left + 160), max(240, bottom - top))
             self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
 
     def _element_item_at(self, view_pos):
@@ -548,6 +795,44 @@ class TrussCanvas(QGraphicsView):
                                  DistributedLoadItem, TrussSegmentItem)):
                 return item
         return None
+
+    def _is_system_drag_hit(self, view_pos, scene_pos: QPointF, system: TrussSystem) -> bool:
+        for item in self.items(view_pos):
+            if isinstance(item, QGraphicsTextItem) and item.data(0) == system.id:
+                return True
+        label_top = self._system_y(system) + DIM_Y_TOTAL - 95
+        label_bottom = self._system_y(system) + DIM_Y_TOTAL - 35
+        return label_top <= scene_pos.y() <= label_bottom
+
+    def _system_label_at(self, view_pos) -> Optional[TrussSystem]:
+        if not self._project:
+            return None
+        for item in self.items(view_pos):
+            if isinstance(item, QGraphicsTextItem):
+                system_id = item.data(0)
+                if system_id:
+                    return next(
+                        (system for system in self._project.systems if system.id == system_id),
+                        None,
+                    )
+        return None
+
+    def _system_rect(self, system: TrussSystem) -> QRectF:
+        return QRectF(
+            self._system_x(system) - 40,
+            self._system_y(system) + DIM_Y_TOTAL - 120,
+            max(system.total_length_m, 1.0) * PX_PER_M + 80,
+            TRUSS_HEIGHT + abs(DIM_Y_TOTAL) + 190,
+        )
+
+    def _systems_overlap(self, moved: TrussSystem) -> bool:
+        moved_rect = self._system_rect(moved)
+        for other in self._visible_systems():
+            if other.id == moved.id:
+                continue
+            if moved_rect.intersects(self._system_rect(other)):
+                return True
+        return False
 
     def _element_from_item(self, item):
         if isinstance(item, SupportItem):

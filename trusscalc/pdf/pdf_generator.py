@@ -38,6 +38,10 @@ from trusscalc.pdf.i18n import tr
 PAGE_W, PAGE_H = A4
 MARGIN = 1.8 * cm
 
+
+def _truss_report_name(truss_type: TrussType) -> str:
+    return truss_type.name or truss_type.display_name
+
 # ── Farbpalette (NoiseGate-Branding) ───────────────────────────────────────
 NAVY = HexColor("#0B1328")          # dunkler Header-Hintergrund
 NAVY_LIGHT = HexColor("#10283A")    # leichte Aufhellung
@@ -267,7 +271,13 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
             multi = len(chapters) > 1
             for idx, chapter in enumerate(chapters, start=1):
                 project = chapter["project"]
-                sub_name = project.name or f"Sub-Projekt {idx}"
+                sub_name = (
+                    f"{chapter.get('sub_project_name')} / {chapter.get('system_name')}"
+                    if chapter.get("sub_project_name") and chapter.get("system_name")
+                    else project.name or f"Sub-Projekt {idx}"
+                )
+                if chapter.get("view_mode") == "compare":
+                    sub_name = f"{sub_name}\nVergleich"
                 if not multi and metadata.sub_project_name:
                     sub_name = metadata.sub_project_name
                 chapter_meta = replace(
@@ -506,7 +516,8 @@ class _HeaderBand(Flowable):
         if self.subtitle:
             c.setFillColor(HexColor("#9DBAC8"))
             c.setFont("Helvetica", 11.5)
-            c.drawString(inner_x, title_bottom - 0.75 * cm, self.subtitle)
+            for idx, line in enumerate(str(self.subtitle).splitlines()):
+                c.drawString(inner_x, title_bottom - (0.75 + 0.45 * idx) * cm, line)
 
         # Trennlinie
         sep_y = 2.7 * cm
@@ -521,7 +532,7 @@ class _HeaderBand(Flowable):
              datetime.datetime.now().strftime("%d.%m.%Y, %H:%M"),
              0.24),  # Anteil der Innenbreite
             (tr(self.lang, "software"), SOFTWARE_VERSION, 0.24),
-            (tr(self.lang, "truss_type"), self.truss_type.display_name, 0.34),
+            (tr(self.lang, "truss_type"), _truss_report_name(self.truss_type), 0.34),
             (tr(self.lang, "total_length"),
              f"{self.project.total_length_m * 100:.0f} cm", 0.18),
         ]
@@ -1416,7 +1427,7 @@ def _partlist_table(project: Project, truss_type: TrussType, lang: str,
     rows = [head]
     lengths = Counter(round(s.length_m, 2) for s in project.sections)
     for length, count in sorted(lengths.items()):
-        rows.append([truss_type.display_name, f"{length * 100:.0f} cm",
+        rows.append([_truss_report_name(truss_type), f"{length * 100:.0f} cm",
                      str(count)])
     for idx, support in enumerate(
         sorted(project.supports, key=lambda s: s.position_m), start=1
@@ -1456,25 +1467,32 @@ def _partlist_table(project: Project, truss_type: TrussType, lang: str,
 # ── Hinweis-Box ────────────────────────────────────────────────────────────
 
 def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> Table:
+    include_system = any(chapter.get("system_name") for chapter in chapters)
     head = [
         tr(lang, "col_subproject"),
-        tr(lang, "col_truss_type"),
         tr(lang, "col_length"),
+        tr(lang, "col_truss_type"),
         tr(lang, "col_pieces"),
     ]
+    if include_system:
+        head.insert(1, tr(lang, "col_system"))
     rows = [head]
     for idx, chapter in enumerate(chapters, start=1):
         project = chapter["project"]
         truss_type = chapter["truss_type"]
-        sub_name = project.name or f"Sub-Projekt {idx}"
+        sub_name = chapter.get("sub_project_name") or project.name or f"Sub-Projekt {idx}"
+        system_name = chapter.get("system_name") or ""
         lengths = Counter(round(s.length_m, 2) for s in project.sections)
         for length, count in sorted(lengths.items()):
-            rows.append([
+            row = [
                 sub_name,
-                truss_type.display_name,
                 f"{length * 100:.0f} cm",
+                _truss_report_name(truss_type),
                 str(count),
-            ])
+            ]
+            if include_system:
+                row.insert(1, system_name)
+            rows.append(row)
         for support_idx, support in enumerate(
             sorted(project.supports, key=lambda s: s.position_m), start=1
         ):
@@ -1482,16 +1500,23 @@ def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> T
                 f"{support.max_force_kg:.0f} kg"
                 if support.has_max_force else tr(lang, "partlist_unlimited")
             )
-            rows.append([
+            row = [
                 sub_name,
-                tr(lang, "partlist_support", n=support_idx),
                 f"{support.position_m * 100:.0f} cm, "
                 f"{tr(lang, 'partlist_max_force', force=force)}",
+                tr(lang, "partlist_support", n=support_idx),
                 "1",
-            ])
+            ]
+            if include_system:
+                row.insert(1, system_name)
+            rows.append(row)
 
     inner_w = PAGE_W - 2 * MARGIN
-    col_w = [inner_w * 0.25, inner_w * 0.38, inner_w * 0.22, inner_w * 0.15]
+    col_w = (
+        [inner_w * 0.20, inner_w * 0.18, inner_w * 0.24, inner_w * 0.26, inner_w * 0.12]
+        if include_system else
+        [inner_w * 0.30, inner_w * 0.28, inner_w * 0.28, inner_w * 0.14]
+    )
     tbl = Table(rows, colWidths=col_w, repeatRows=1)
     style = [
         ("BACKGROUND", (0, 0), (-1, 0), TABLE_HEAD_BG),
@@ -1502,7 +1527,7 @@ def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> T
         ("FONTSIZE", (0, 1), (-1, -1), 8.5),
         ("TEXTCOLOR", (0, 1), (-1, -1), TEXT_DARK),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (2, 0), (3, -1), "RIGHT"),
+        ("ALIGN", ((3 if include_system else 2), 0), (-1, -1), "RIGHT"),
         ("LINEBELOW", (0, 0), (-1, 0), 0.4, CARD_BORDER),
         ("LEFTPADDING", (0, 0), (-1, -1), 8),
         ("RIGHTPADDING", (0, 0), (-1, -1), 8),
