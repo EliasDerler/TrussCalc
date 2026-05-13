@@ -8,7 +8,7 @@ aus dem Quellcode.
 1. Öffne die aktuelle Release-Seite:
    https://github.com/EliasDerler/TrussCalc/releases/latest
 
-2. Lade die Datei `TrussCalc-Windows-v0.2.0.zip` herunter.
+2. Lade die Datei `TrussCalc-Windows-v0.2.1.zip` herunter.
 
 3. Entpacke die ZIP-Datei in einen festen Ordner, zum Beispiel:
    `C:\Programme\TrussCalc` oder `C:\Users\<Name>\Programme\TrussCalc`
@@ -17,6 +17,12 @@ aus dem Quellcode.
 
 Wichtig: Der Ordner `_internal` muss neben `TrussCalc.exe` liegen. Nicht nur die
 EXE einzeln verschieben, sonst fehlen Programmbibliotheken.
+
+Beim ersten Start der Windows-Version legt TrussCalc automatisch eine
+Desktop-Verknüpfung und eine Startmenü-Verknüpfung mit TrussCalc-Logo an.
+Windows erlaubt echtes automatisches Anheften an Start/Taskleiste nicht
+zuverlässig über eine normale Anwendung; die Verknüpfungen sind deshalb der
+unterstützte Startweg.
 
 ## Erster Start
 
