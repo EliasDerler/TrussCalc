@@ -80,7 +80,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._action("Wiederholen", self._redo, "Ctrl+Y"))
         edit_menu.addAction(self._action("Auswahl kopieren", self._copy_selected, "Ctrl+C"))
         edit_menu.addAction(self._action("Kopie platzieren", self._paste_copy, "Ctrl+V"))
-        edit_menu.addAction(self._action("Auswahl spiegeln", self._mirror_selected, "M"))
+        edit_menu.addAction(self._action("Auswahl spiegeln", self._mirror_selected, "Ctrl+M"))
         edit_menu.addAction(self._action("Alles zurücksetzen", self._reset_canvas))
         edit_menu.addSeparator()
         edit_menu.addAction(self._action("Ausgewähltes löschen", self._delete_selected, "Del"))
@@ -126,8 +126,8 @@ class MainWindow(QMainWindow):
             tb.addAction(act)
 
         tb.addSeparator()
-        tb.addAction(self._action("Kopieren", self._copy_selected, "Ctrl+C"))
-        tb.addAction(self._action("Spiegeln", self._mirror_selected, "M"))
+        tb.addAction(self._action("Kopieren", self._copy_selected))
+        tb.addAction(self._action("Spiegeln", self._mirror_selected))
         tb.addSeparator()
         tb.addAction(self._action("▶▶ Berechnen [F5]", self._run_calculation))
         tb.addAction(self._action("✕ Reset", self._clear_results))
@@ -1185,7 +1185,7 @@ class MainWindow(QMainWindow):
             self._paste_copy()
             event.accept()
             return
-        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_M:
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_M:
             self._mirror_selected()
             event.accept()
             return

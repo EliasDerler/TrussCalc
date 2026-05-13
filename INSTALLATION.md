@@ -8,7 +8,7 @@ aus dem Quellcode.
 1. Öffne die aktuelle Release-Seite:
    https://github.com/EliasDerler/TrussCalc/releases/latest
 
-2. Lade die Datei `TrussCalc-Windows-v0.2.2.zip` herunter.
+2. Lade die Datei `TrussCalc-Windows-v0.2.3.zip` herunter.
 
 3. Entpacke die ZIP-Datei in einen festen Ordner, zum Beispiel:
    `C:\Programme\TrussCalc` oder `C:\Users\<Name>\Programme\TrussCalc`

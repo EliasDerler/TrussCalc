@@ -368,7 +368,7 @@ class TrussCanvas(QGraphicsView):
             self.paste_requested.emit()
             event.accept()
             return
-        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_M:
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_M:
             self.mirror_requested.emit()
             event.accept()
             return
