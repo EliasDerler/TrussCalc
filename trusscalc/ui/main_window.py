@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QToolBar,
     QStatusBar, QMessageBox, QFileDialog, QInputDialog, QLabel,
     QComboBox, QSplitter, QDialog, QApplication, QProgressDialog,
+    QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QIcon
@@ -43,6 +44,8 @@ class MainWindow(QMainWindow):
         self._redo_stack: list = []
         self._project_path: Optional[str] = None
         self._update_worker = None
+        self._pdf_worker = None
+        self._copy_templates: list = []
         self._setup_ui()
         self._apply_dark_theme()
         self._new_project()
@@ -76,6 +79,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._action("Rückgängig", self._undo, "Ctrl+Z"))
         edit_menu.addAction(self._action("Wiederholen", self._redo, "Ctrl+Y"))
         edit_menu.addAction(self._action("Auswahl kopieren", self._copy_selected, "Ctrl+C"))
+        edit_menu.addAction(self._action("Kopie platzieren", self._paste_copy, "Ctrl+V"))
         edit_menu.addAction(self._action("Auswahl spiegeln", self._mirror_selected, "M"))
         edit_menu.addAction(self._action("Alles zurücksetzen", self._reset_canvas))
         edit_menu.addSeparator()
@@ -155,6 +159,14 @@ class MainWindow(QMainWindow):
         self._canvas.element_selected.connect(self._on_element_selected)
         self._canvas.element_deleted.connect(self._on_element_deleted)
         self._canvas.element_context_requested.connect(self._on_edit_element)
+        self._canvas.copy_place_requested.connect(self._place_copy_at)
+        self._canvas.copy_cancel_requested.connect(
+            lambda: self._status.showMessage("Kopieren abgebrochen")
+        )
+        self._canvas.copy_requested.connect(self._copy_selected)
+        self._canvas.paste_requested.connect(self._paste_copy)
+        self._canvas.mirror_requested.connect(self._mirror_selected)
+        self._canvas.delete_requested.connect(self._delete_selected)
         self._canvas.status_message.connect(self._status.showMessage)
 
         self._props = PropertiesPanel()
@@ -536,39 +548,37 @@ class MainWindow(QMainWindow):
         if not selected:
             QMessageBox.information(self, "Kopieren", "Bitte zuerst ein Objekt auswÃ¤hlen.")
             return
+        self._copy_templates = [copy.deepcopy(e) for e in selected]
+        self._canvas.begin_copy_mode(self._copy_templates)
+        self._status.showMessage(
+            f"{len(selected)} Objekt(e) kopiert - Linksklick platziert, Rechtsklick bricht ab"
+        )
+
+    def _paste_copy(self) -> None:
+        if not self._copy_templates:
+            self._copy_selected()
+            return
+        self._canvas.begin_copy_mode(self._copy_templates)
+        self._status.showMessage("Kopie bereit - Linksklick platziert, Rechtsklick bricht ab")
+
+    def _place_copy_at(self, anchor_m: float) -> None:
+        if not self._project or not self._copy_templates:
+            self._canvas.finish_copy_placement()
+            return
+        clones = self._clones_at_anchor(self._copy_templates, anchor_m)
+        if not clones:
+            self._canvas.finish_copy_placement()
+            return
         self._push_undo()
-        offset_m = 0.5
-        total = max(self._project.total_length_m, 0.0)
-        for element in selected:
-            if isinstance(element, TrussSection):
-                clone = copy.deepcopy(element)
-                clone.id = str(uuid.uuid4())
-                clone.position_m = max(0.0, element.position_m + offset_m)
-                self._project.sections.append(clone)
-            elif isinstance(element, Support):
-                clone = copy.deepcopy(element)
-                clone.id = str(uuid.uuid4())
-                clone.position_m = min(total, max(0.0, element.position_m + offset_m)) if total else element.position_m + offset_m
-                self._project.supports.append(clone)
-            elif isinstance(element, PointLoad):
-                clone = copy.deepcopy(element)
-                clone.id = str(uuid.uuid4())
-                clone.position_m = min(total, max(0.0, element.position_m + offset_m)) if total else element.position_m + offset_m
-                self._project.point_loads.append(clone)
-            elif isinstance(element, DistributedLoad):
-                clone = copy.deepcopy(element)
-                clone.id = str(uuid.uuid4())
-                length = element.end_m - element.start_m
-                clone.start_m = max(0.0, element.start_m + offset_m)
-                clone.end_m = clone.start_m + length
-                if total and clone.end_m > total:
-                    clone.end_m = total
-                    clone.start_m = max(0.0, total - length)
-                self._project.distributed_loads.append(clone)
+        for clone in clones:
+            self._append_project_element(clone)
         self._clear_results()
+        self._canvas.finish_copy_placement()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
-        self._status.showMessage(f"{len(selected)} Objekt(e) kopiert")
+        self._status.showMessage(f"{len(clones)} Objekt(e) platziert")
+        if len(clones) == 1:
+            self._on_edit_element(clones[0])
 
     def _mirror_selected(self) -> None:
         if not self._project:
@@ -581,25 +591,99 @@ class MainWindow(QMainWindow):
         if total <= 0:
             return
         self._push_undo()
+        clones = []
         for element in selected:
+            clone = copy.deepcopy(element)
+            clone.id = str(uuid.uuid4())
             if isinstance(element, TrussSection):
-                element.position_m = max(0.0, total - (element.position_m + element.length_m))
+                clone.position_m = max(0.0, total - (element.position_m + element.length_m))
             elif isinstance(element, Support):
-                element.position_m = max(0.0, min(total, total - element.position_m))
+                clone.position_m = max(0.0, min(total, total - element.position_m))
             elif isinstance(element, PointLoad):
-                element.position_m = max(0.0, min(total, total - element.position_m))
+                clone.position_m = max(0.0, min(total, total - element.position_m))
             elif isinstance(element, DistributedLoad):
                 start = total - element.end_m
                 end = total - element.start_m
-                element.start_m = max(0.0, min(total, start))
-                element.end_m = max(0.0, min(total, end))
+                clone.start_m = max(0.0, min(total, start))
+                clone.end_m = max(0.0, min(total, end))
+            clones.append(clone)
+        for clone in clones:
+            self._append_project_element(clone)
         self._clear_results()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
-        self._status.showMessage(f"{len(selected)} Objekt(e) gespiegelt")
+        self._status.showMessage(f"{len(clones)} Objekt(e) kopiert und gespiegelt")
 
     def _delete_selected(self) -> None:
-        self._canvas.remove_selected()
+        if not self._project:
+            return
+        selected = self._canvas.selected_elements()
+        if not selected:
+            return
+        ids = {element.id for element in selected if getattr(element, "id", None)}
+        if not ids:
+            return
+        self._push_undo()
+        self._project.sections = [s for s in self._project.sections if s.id not in ids]
+        self._project.supports = [s for s in self._project.supports if s.id not in ids]
+        self._project.point_loads = [p for p in self._project.point_loads if p.id not in ids]
+        self._project.distributed_loads = [d for d in self._project.distributed_loads if d.id not in ids]
+        self._clear_results()
+        self._canvas.load_project(self._project)
+        self._props.show_project_summary(self._project, self._truss_type)
+        self._status.showMessage(f"{len(ids)} Objekt(e) geloescht")
+
+    def _clones_at_anchor(self, templates: list, anchor_m: float) -> list:
+        if not templates:
+            return []
+        source_anchor = min(self._element_start_m(e) for e in templates)
+        total = self._project.total_length_m if self._project else 0.0
+        clones = []
+        for template in templates:
+            clone = copy.deepcopy(template)
+            clone.id = str(uuid.uuid4())
+            offset = anchor_m - source_anchor
+            if isinstance(clone, TrussSection):
+                clone.position_m = max(0.0, clone.position_m + offset)
+            elif isinstance(clone, Support):
+                clone.position_m = max(0.0, clone.position_m + offset)
+                if total:
+                    clone.position_m = min(total, clone.position_m)
+            elif isinstance(clone, PointLoad):
+                clone.position_m = max(0.0, clone.position_m + offset)
+                if total:
+                    clone.position_m = min(total, clone.position_m)
+            elif isinstance(clone, DistributedLoad):
+                length = clone.end_m - clone.start_m
+                clone.start_m = max(0.0, clone.start_m + offset)
+                clone.end_m = clone.start_m + length
+                if total and clone.end_m > total:
+                    clone.end_m = total
+                    clone.start_m = max(0.0, total - length)
+            clones.append(clone)
+        return clones
+
+    def _append_project_element(self, element) -> None:
+        if isinstance(element, TrussSection):
+            self._project.sections.append(element)
+        elif isinstance(element, Support):
+            self._project.supports.append(element)
+        elif isinstance(element, PointLoad):
+            self._project.point_loads.append(element)
+        elif isinstance(element, DistributedLoad):
+            self._project.distributed_loads.append(element)
+
+    @staticmethod
+    def _element_start_m(element) -> float:
+        if isinstance(element, TrussSection):
+            return element.position_m
+        if isinstance(element, Support):
+            return element.position_m
+        if isinstance(element, PointLoad):
+            return element.position_m
+        if isinstance(element, DistributedLoad):
+            return element.start_m
+        return 0.0
 
     def _undo_placeholder_removed(self) -> None:
         pass
@@ -955,23 +1039,61 @@ class MainWindow(QMainWindow):
         progress.setMinimumWidth(380)
         progress.show()
         QApplication.processEvents()
-        try:
-            from trusscalc.pdf.pdf_generator import generate_report
-            from trusscalc.database.db_manager import load_truss_pdf
-            pdf_bytes = load_truss_pdf(self._truss_type.id)
-            generate_report(
-                path=path,
-                project=self._project,
-                truss_type=self._truss_type,
-                result=self._last_result,
-                datasheet_pdf_bytes=pdf_bytes,
-                metadata=metadata,
-            )
-            self._status.showMessage(f"PDF-Report gespeichert: {path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "PDF-Fehler", str(exc))
-        finally:
+        from trusscalc.database.db_manager import load_truss_pdf
+        pdf_bytes = load_truss_pdf(self._truss_type.id)
+
+        class _PdfWorker(QThread):
+            done_signal = pyqtSignal(str)
+            error_signal = pyqtSignal(str)
+
+            def __init__(self, pdf_path, project, truss_type, result, datasheet_bytes, report_metadata):
+                super().__init__()
+                self.pdf_path = pdf_path
+                self.project = project
+                self.truss_type = truss_type
+                self.result = result
+                self.datasheet_bytes = datasheet_bytes
+                self.report_metadata = report_metadata
+
+            def run(self):
+                try:
+                    from trusscalc.pdf.pdf_generator import generate_report
+                    generate_report(
+                        path=self.pdf_path,
+                        project=self.project,
+                        truss_type=self.truss_type,
+                        result=self.result,
+                        datasheet_pdf_bytes=self.datasheet_bytes,
+                        metadata=self.report_metadata,
+                    )
+                    self.done_signal.emit(self.pdf_path)
+                except Exception as exc:
+                    self.error_signal.emit(str(exc))
+
+        worker = _PdfWorker(
+            path,
+            copy.deepcopy(self._project),
+            copy.deepcopy(self._truss_type),
+            copy.deepcopy(self._last_result),
+            pdf_bytes,
+            metadata,
+        )
+
+        def _on_done(saved_path: str) -> None:
             progress.close()
+            self._pdf_worker = None
+            self._status.showMessage(f"PDF-Report gespeichert: {saved_path}")
+
+        def _on_error(msg: str) -> None:
+            progress.close()
+            self._pdf_worker = None
+            QMessageBox.critical(self, "PDF-Fehler", msg)
+
+        worker.done_signal.connect(_on_done)
+        worker.error_signal.connect(_on_error)
+        worker.finished.connect(worker.deleteLater)
+        self._pdf_worker = worker
+        worker.start()
 
     # ── Design ────────────────────────────────────────────────────────────────
 
@@ -1048,3 +1170,34 @@ class MainWindow(QMainWindow):
         if shortcut:
             act.setShortcut(QKeySequence(shortcut))
         return act
+
+    def keyPressEvent(self, event) -> None:
+        if self._focus_accepts_text():
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        mods = event.modifiers()
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_C:
+            self._copy_selected()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_V:
+            self._paste_copy()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_M:
+            self._mirror_selected()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Delete:
+            self._delete_selected()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _focus_accepts_text(self) -> bool:
+        widget = QApplication.focusWidget()
+        return isinstance(
+            widget,
+            (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox),
+        )

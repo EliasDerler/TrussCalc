@@ -123,6 +123,7 @@ def generate_report(
     metadata=None,
 ) -> None:
     """Erzeugt den PDF-Report. ``metadata`` ist ein ReportMetadata-Dataclass."""
+    path = str(path)
     if metadata is None:
         from trusscalc.ui.dialogs.report_metadata_dialog import ReportMetadata
         metadata = ReportMetadata(

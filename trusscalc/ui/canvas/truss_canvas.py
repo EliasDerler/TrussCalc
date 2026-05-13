@@ -3,6 +3,7 @@
 LTSpice-inspiriert: Raster, Pan/Zoom, Werkzeug-basierte Platzierung.
 """
 import uuid
+import copy
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -36,6 +37,12 @@ class TrussCanvas(QGraphicsView):
     element_added = pyqtSignal(object)
     element_deleted = pyqtSignal(object)
     element_context_requested = pyqtSignal(object)
+    copy_place_requested = pyqtSignal(float)
+    copy_cancel_requested = pyqtSignal()
+    copy_requested = pyqtSignal()
+    paste_requested = pyqtSignal()
+    mirror_requested = pyqtSignal()
+    delete_requested = pyqtSignal()
     request_support_dialog = pyqtSignal(float)          # Position in m
     request_point_load_dialog = pyqtSignal(float)
     request_dist_load_dialog = pyqtSignal(float, float) # start_m, end_m
@@ -51,6 +58,10 @@ class TrussCanvas(QGraphicsView):
         self._dist_load_start: Optional[float] = None
         self._panning = False
         self._pan_last_pos = None
+        self._copy_mode = False
+        self._copy_templates: list = []
+        self._copy_anchor_m = 0.0
+        self._copy_preview_items: list[QGraphicsItem] = []
 
         # Canvas-Items (Position_id → Item)
         self._section_items: dict[str, TrussSegmentItem] = {}
@@ -84,6 +95,7 @@ class TrussCanvas(QGraphicsView):
     # ── Projekt laden ─────────────────────────────────────────────────────────
 
     def load_project(self, project: Project) -> None:
+        self.cancel_copy_mode()
         self._project = project
         self._rebuild_scene()
 
@@ -258,6 +270,17 @@ class TrussCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         pos_m = scene_pos.x() / PX_PER_M
 
+        if self._copy_mode:
+            if event.button() == Qt.MouseButton.RightButton:
+                self.cancel_copy_mode()
+                self.copy_cancel_requested.emit()
+                event.accept()
+                return
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.copy_place_requested.emit(max(0.0, pos_m))
+                event.accept()
+                return
+
         if event.button() == Qt.MouseButton.RightButton:
             item = self._element_item_at(event.pos())
             if item:
@@ -325,11 +348,35 @@ class TrussCanvas(QGraphicsView):
             )
             event.accept()
             return
+        if self._copy_mode:
+            scene_pos = self.mapToScene(event.pos())
+            self._update_copy_preview(max(0.0, scene_pos.x() / PX_PER_M))
         super().mouseMoveEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        mods = event.modifiers()
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_C:
+            self.copy_requested.emit()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_V:
+            self.paste_requested.emit()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_M:
+            self.mirror_requested.emit()
+            event.accept()
+            return
+        if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Delete:
+            self.delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ── Raster zeichnen ───────────────────────────────────────────────────────
 
@@ -382,6 +429,94 @@ class TrussCanvas(QGraphicsView):
             elif isinstance(item, TrussSegmentItem):
                 self.element_deleted.emit(item.section)
         self._draw_dimensions()
+
+    def begin_copy_mode(self, elements: list) -> None:
+        self.cancel_copy_mode()
+        self._copy_templates = [copy.deepcopy(e) for e in elements]
+        if not self._copy_templates:
+            return
+        self._copy_anchor_m = min(self._element_start_m(e) for e in self._copy_templates)
+        self._copy_mode = True
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._update_copy_preview(self._copy_anchor_m)
+
+    def cancel_copy_mode(self) -> None:
+        self._copy_mode = False
+        self._copy_templates = []
+        self._clear_copy_preview()
+        if self._current_tool == CanvasTool.SELECT:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def finish_copy_placement(self) -> None:
+        self._copy_mode = False
+        self._clear_copy_preview()
+        if self._current_tool == CanvasTool.SELECT:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def _update_copy_preview(self, anchor_m: float) -> None:
+        self._clear_copy_preview()
+        if not self._copy_templates:
+            return
+        for template in self._copy_templates:
+            clone = copy.deepcopy(template)
+            self._move_clone_to_anchor(clone, anchor_m)
+            item = self._preview_item_for(clone)
+            if item is None:
+                continue
+            item.setOpacity(0.45)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            self.scene().addItem(item)
+            self._copy_preview_items.append(item)
+
+    def _clear_copy_preview(self) -> None:
+        for item in self._copy_preview_items:
+            if item.scene() is self.scene():
+                self.scene().removeItem(item)
+        self._copy_preview_items.clear()
+
+    def _preview_item_for(self, element):
+        if isinstance(element, TrussSection):
+            item = TrussSegmentItem(element)
+            item.setPos(element.position_m * PX_PER_M, 0)
+            return item
+        if isinstance(element, Support):
+            item = SupportItem(element)
+            item.setPos(element.position_m * PX_PER_M, TRUSS_HEIGHT // 2)
+            return item
+        if isinstance(element, PointLoad):
+            item = PointLoadItem(element)
+            item.setPos(element.position_m * PX_PER_M, 0)
+            return item
+        if isinstance(element, DistributedLoad):
+            item = DistributedLoadItem(element)
+            item.setPos(element.start_m * PX_PER_M, 0)
+            return item
+        return None
+
+    def _move_clone_to_anchor(self, element, anchor_m: float) -> None:
+        offset = anchor_m - self._copy_anchor_m
+        if isinstance(element, TrussSection):
+            element.position_m = max(0.0, element.position_m + offset)
+        elif isinstance(element, Support):
+            element.position_m = max(0.0, element.position_m + offset)
+        elif isinstance(element, PointLoad):
+            element.position_m = max(0.0, element.position_m + offset)
+        elif isinstance(element, DistributedLoad):
+            length = element.end_m - element.start_m
+            element.start_m = max(0.0, element.start_m + offset)
+            element.end_m = element.start_m + length
+
+    @staticmethod
+    def _element_start_m(element) -> float:
+        if isinstance(element, TrussSection):
+            return element.position_m
+        if isinstance(element, Support):
+            return element.position_m
+        if isinstance(element, PointLoad):
+            return element.position_m
+        if isinstance(element, DistributedLoad):
+            return element.start_m
+        return 0.0
 
     def selected_elements(self) -> list:
         elements = []

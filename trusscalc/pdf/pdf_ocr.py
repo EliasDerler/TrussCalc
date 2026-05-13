@@ -56,9 +56,15 @@ class PaddleOCRPdfParser:
         Einträge sowie etwaige Metadaten."""
         if progress_cb:
             progress_cb("Lade KI-Modelle…")
-        self._ensure_pipeline()
-
         result = OcrParseResult()
+        try:
+            self._ensure_pipeline()
+        except Exception as exc:
+            self._pipeline = None
+            result.warnings.append(
+                "PaddleOCR/PP-Structure konnte nicht initialisiert werden; "
+                f"verwende PDF-Text-Fallback. Details: {exc}"
+            )
 
         import pymupdf
         doc = pymupdf.open(pdf_path)
@@ -79,6 +85,8 @@ class PaddleOCRPdfParser:
                     all_text.append(page_text)
             except Exception:
                 pass
+            if self._pipeline is None:
+                continue
             pix = page.get_pixmap(dpi=200)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 img_path = f.name
