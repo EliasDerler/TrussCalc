@@ -8,7 +8,8 @@ from typing import Optional
 from trusscalc.core.models import (
     TrussType, LoadTableEntry, LoadType, TrussSource, Project,
     ProjectBundle, TrussSystem, TrussSection, Support, PointLoad,
-    DistributedLoad, UnitSystem,
+    DistributedLoad, UnitSystem, TowerInput, TowerFoundation,
+    TowerConnector, TowerResult,
 )
 
 _DB_PATH = Path(os.environ.get("TRUSSCALC_DB", "trusscalc.db"))
@@ -294,6 +295,131 @@ def _dict_to_system(data: dict, idx: int = 0) -> TrussSystem:
     )
 
 
+def _tower_input_to_dict(data: TowerInput | None) -> dict | None:
+    if data is None:
+        return None
+    return {
+        "truss_type_id": data.truss_type_id,
+        "height_m": data.height_m,
+        "horizontal_force_kn": data.horizontal_force_kn,
+        "force_height_m": data.force_height_m,
+        "payload_kg": data.payload_kg,
+        "payload_eccentricity_m": data.payload_eccentricity_m,
+        "gamma": data.gamma,
+        "foundation": {
+            "type": data.foundation.type,
+            "width_m": data.foundation.width_m,
+            "depth_m": data.foundation.depth_m,
+            "weight_kg": data.foundation.weight_kg,
+            "ballast_kg": data.foundation.ballast_kg,
+            "ballast_offset_m": data.foundation.ballast_offset_m,
+            "clearance_mm": data.foundation.clearance_mm,
+            "insertion_depth_m": data.foundation.insertion_depth_m,
+        },
+        "connector": {
+            "bolt_count": data.connector.bolt_count,
+            "bolt_lever_arm_m": data.connector.bolt_lever_arm_m,
+            "allowable_tension_kn": data.connector.allowable_tension_kn,
+            "allowable_shear_kn": data.connector.allowable_shear_kn,
+        },
+    }
+
+
+def _dict_to_tower_input(data: dict | None) -> TowerInput:
+    data = data or {}
+    foundation_data = data.get("foundation") or {}
+    connector_data = data.get("connector") or {}
+    return TowerInput(
+        truss_type_id=int(data.get("truss_type_id") or 0),
+        height_m=float(data.get("height_m", 4.0)),
+        horizontal_force_kn=float(data.get("horizontal_force_kn", 1.0)),
+        force_height_m=float(data.get("force_height_m", data.get("height_m", 4.0))),
+        payload_kg=float(data.get("payload_kg", 0.0)),
+        payload_eccentricity_m=float(data.get("payload_eccentricity_m", 0.0)),
+        gamma=float(data.get("gamma", 1.30)),
+        foundation=TowerFoundation(
+            type=foundation_data.get("type", "steel_plate"),
+            width_m=float(foundation_data.get("width_m", 1.0)),
+            depth_m=float(foundation_data.get("depth_m", 1.0)),
+            weight_kg=float(foundation_data.get("weight_kg", 120.0)),
+            ballast_kg=float(foundation_data.get("ballast_kg", 0.0)),
+            ballast_offset_m=float(foundation_data.get("ballast_offset_m", 0.0)),
+            clearance_mm=float(foundation_data.get("clearance_mm", 0.0)),
+            insertion_depth_m=float(foundation_data.get("insertion_depth_m", 0.5)),
+        ),
+        connector=TowerConnector(
+            bolt_count=int(connector_data.get("bolt_count", 4)),
+            bolt_lever_arm_m=float(connector_data.get("bolt_lever_arm_m", 0.25)),
+            allowable_tension_kn=float(connector_data.get("allowable_tension_kn", 5.0)),
+            allowable_shear_kn=float(connector_data.get("allowable_shear_kn", 5.0)),
+        ),
+    )
+
+
+def _tower_result_to_dict(result: TowerResult | None) -> dict | None:
+    if result is None:
+        return None
+    return {
+        "design_moment_knm": result.design_moment_knm,
+        "resisting_moment_knm": result.resisting_moment_knm,
+        "tipping_utilization": result.tipping_utilization,
+        "required_ballast_kg": result.required_ballast_kg,
+        "tower_self_weight_kg": result.tower_self_weight_kg,
+        "total_vertical_load_kg": result.total_vertical_load_kg,
+        "base_shear_kn": result.base_shear_kn,
+        "base_compression_kg": result.base_compression_kg,
+        "bolt_tension_kn": result.bolt_tension_kn,
+        "bolt_shear_kn": result.bolt_shear_kn,
+        "bolt_utilization": result.bolt_utilization,
+        "top_offset_mm": result.top_offset_mm,
+        "bending_deflection_mm": result.bending_deflection_mm,
+        "total_top_displacement_mm": result.total_top_displacement_mm,
+        "status": result.status,
+        "warnings": result.warnings,
+        "is_valid": result.is_valid,
+        "max_horizontal_force_kn": result.max_horizontal_force_kn,
+        "edge_force_kn": result.edge_force_kn,
+        "edge_force_kg": result.edge_force_kg,
+    }
+
+
+def _dict_to_tower_result(data: dict | None) -> TowerResult | None:
+    if not data:
+        return None
+    return TowerResult(
+        design_moment_knm=float(data.get("design_moment_knm", 0.0)),
+        resisting_moment_knm=float(data.get("resisting_moment_knm", 0.0)),
+        tipping_utilization=float(data.get("tipping_utilization", 0.0)),
+        required_ballast_kg=float(data.get("required_ballast_kg", 0.0)),
+        tower_self_weight_kg=float(data.get("tower_self_weight_kg", 0.0)),
+        total_vertical_load_kg=float(data.get("total_vertical_load_kg", 0.0)),
+        base_shear_kn=float(data.get("base_shear_kn", 0.0)),
+        base_compression_kg=float(data.get("base_compression_kg", 0.0)),
+        bolt_tension_kn=float(data.get("bolt_tension_kn", 0.0)),
+        bolt_shear_kn=float(data.get("bolt_shear_kn", 0.0)),
+        bolt_utilization=float(data.get("bolt_utilization", 0.0)),
+        top_offset_mm=float(data.get("top_offset_mm", 0.0)),
+        bending_deflection_mm=float(data.get("bending_deflection_mm", 0.0)),
+        total_top_displacement_mm=float(
+            data.get(
+                "total_top_displacement_mm",
+                float(data.get("top_offset_mm", 0.0)) + float(data.get("bending_deflection_mm", 0.0)),
+            )
+        ),
+        status=data.get("status", "green"),
+        warnings=list(data.get("warnings", [])),
+        is_valid=bool(data.get("is_valid", True)),
+        max_horizontal_force_kn=float(data.get("max_horizontal_force_kn", 0.0)),
+        edge_force_kn=float(
+            data.get(
+                "edge_force_kn",
+                float(data.get("edge_force_kg", 0.0)) * 9.80665 / 1000.0,
+            )
+        ),
+        edge_force_kg=float(data.get("edge_force_kg", 0.0)),
+    )
+
+
 def save_project_to_file(path: str, project: Project) -> None:
     """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON)."""
     payload = {
@@ -329,7 +455,7 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
         id=pid,
         name=name,
         description=desc,
-        truss_type_id=d["truss_type_id"],
+        truss_type_id=int(d.get("truss_type_id") or 0),
         unit_system=UnitSystem(d.get("unit_system", UnitSystem.KG_M.value)),
         sections=sections,
         supports=supports,
@@ -343,6 +469,9 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
         plan_system_id=d.get("plan_system_id"),
         compare_system_ids=list(d.get("compare_system_ids", [])),
         view_mode=d.get("view_mode", "plan"),
+        kind=d.get("kind", "beam"),
+        tower_input=_dict_to_tower_input(d.get("tower_input")) if d.get("kind") == "tower" else None,
+        tower_result=_dict_to_tower_result(d.get("tower_result")),
     )
     if not project.systems and (
         project.truss_type_id or project.sections or project.supports
@@ -359,11 +488,14 @@ def _project_to_dict_v2(project: Project) -> dict:
     data = json.loads(_project_to_json(project))
     data["name"] = project.name
     data["description"] = project.description
+    data["kind"] = project.kind or "beam"
     data["active_system_id"] = project.active_system_id
     data["plan_system_id"] = project.plan_system_id
     data["compare_system_ids"] = project.compare_system_ids
     data["view_mode"] = project.view_mode
     data["systems"] = [_system_to_dict(system) for system in project.systems]
+    data["tower_input"] = _tower_input_to_dict(project.tower_input)
+    data["tower_result"] = _tower_result_to_dict(project.tower_result)
     return data
 
 
@@ -381,7 +513,7 @@ def _ensure_bundle(project: Project | ProjectBundle) -> ProjectBundle:
 
 def _bundle_to_json(bundle: ProjectBundle) -> str:
     return json.dumps({
-        "format_version": 3,
+        "format_version": 4,
         "unit_system": bundle.unit_system.value,
         "subprojects": [_project_to_dict_v2(p) for p in bundle.subprojects],
     }, ensure_ascii=False)
@@ -394,6 +526,11 @@ def _dict_to_project_v2(data: dict, name: str = "", desc: str = "") -> Project:
         name=data.get("name") or name,
         desc=data.get("description") or desc,
     )
+    project.kind = data.get("kind", "beam")
+    if project.kind == "tower":
+        project.tower_input = _dict_to_tower_input(data.get("tower_input"))
+        project.tower_result = _dict_to_tower_result(data.get("tower_result"))
+        project.truss_type_id = project.tower_input.truss_type_id
     return project
 
 
@@ -422,6 +559,9 @@ def _json_to_bundle(data: str, pid: int, name: str, desc: str) -> ProjectBundle:
     if not projects:
         projects = [Project(name="Sub-Projekt 1", truss_type_id=0, unit_system=unit)]
     for project in projects:
+        project.kind = project.kind or "beam"
+        if project.kind == "tower" and project.tower_input is None:
+            project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
         project.unit_system = unit
         _ensure_project_systems(project)
     return ProjectBundle(
@@ -437,7 +577,7 @@ def save_project_to_file(path: str, project: Project | ProjectBundle) -> None:
     """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON v3)."""
     bundle = _ensure_bundle(project)
     payload = {
-        "format_version": 3,
+        "format_version": 4,
         "name": bundle.name,
         "description": bundle.description,
         "data": json.loads(_bundle_to_json(bundle)),
@@ -475,6 +615,11 @@ def _legacy_project_to_system(project: Project) -> TrussSystem:
 
 def _ensure_project_systems(project: Project) -> None:
     import uuid
+    if getattr(project, "kind", "beam") == "tower":
+        if project.tower_input is None:
+            project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
+        project.truss_type_id = project.tower_input.truss_type_id
+        return
     if not project.systems:
         if (
             project.truss_type_id or project.sections or project.supports

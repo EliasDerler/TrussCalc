@@ -4,6 +4,7 @@ LTSpice-inspiriertes Layout: Menüleiste, Toolbar, Bibliothek-Panel (links),
 2D-Canvas (Mitte), Eigenschaften-Panel (rechts), Statusleiste.
 """
 import copy
+import json
 import uuid
 from typing import Optional
 
@@ -12,21 +13,23 @@ from PyQt6.QtWidgets import (
     QStatusBar, QMessageBox, QFileDialog, QInputDialog, QLabel,
     QComboBox, QSplitter, QDialog, QApplication, QProgressDialog,
     QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
-    QPushButton, QTabWidget, QMenu,
+    QPushButton, QTabWidget, QMenu, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QSize, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence, QIcon
 
 from trusscalc.core.models import (
     Project, ProjectBundle, TrussSystem, TrussType, TrussSection, Support,
-    PointLoad, DistributedLoad, UnitSystem, CalculationResult,
+    PointLoad, DistributedLoad, UnitSystem, CalculationResult, TowerInput,
 )
 from trusscalc.core import calculator
+from trusscalc.core import tower_calculator
 from trusscalc.core.interpolator import LoadTableInterpolator
 from trusscalc.ui.canvas.truss_canvas import TrussCanvas
 from trusscalc.ui.canvas.canvas_tools import CanvasTool
 from trusscalc.ui.panels.truss_library_panel import TrussLibraryPanel
 from trusscalc.ui.panels.properties_panel import PropertiesPanel
+from trusscalc.ui.panels.tower_panel import TowerPanel
 from trusscalc.ui.dialogs.support_dialog import SupportDialog
 from trusscalc.ui.dialogs.load_dialog import PointLoadDialog, DistributedLoadDialog
 from trusscalc.ui.dialogs.section_dialog import SectionDialog
@@ -51,9 +54,12 @@ class MainWindow(QMainWindow):
         self._subproject_redo_stacks: list[list] = []
         self._updating_tabs = False
         self._project_path: Optional[str] = None
+        self._is_dirty = False
+        self._saved_project_signature = ""
         self._update_worker = None
         self._pdf_worker = None
         self._copy_templates: list = []
+        self._tower_cache_key = "__tower__"
         self._setup_ui()
         self._apply_dark_theme()
         self._new_project()
@@ -183,7 +189,12 @@ class MainWindow(QMainWindow):
         self._canvas.paste_requested.connect(self._paste_copy)
         self._canvas.mirror_requested.connect(self._mirror_selected)
         self._canvas.delete_requested.connect(self._delete_selected)
+        self._canvas.project_changed.connect(self._mark_dirty)
         self._canvas.status_message.connect(self._status.showMessage)
+
+        self._tower_panel = TowerPanel()
+        self._tower_panel.changed.connect(self._on_tower_changed)
+        self._tower_panel.calculate_requested.connect(self._run_calculation)
 
         self._props = PropertiesPanel()
         self._props.edit_requested.connect(self._on_edit_element)
@@ -241,7 +252,10 @@ class MainWindow(QMainWindow):
         center_layout.setSpacing(3)
         center_layout.addWidget(self._tabs)
         center_layout.addWidget(self._system_bar)
-        center_layout.addWidget(self._canvas, 1)
+        self._work_stack = QStackedWidget()
+        self._work_stack.addWidget(self._canvas)
+        self._work_stack.addWidget(self._tower_panel)
+        center_layout.addWidget(self._work_stack, 1)
 
         splitter.addWidget(self._library)
         splitter.addWidget(center)
@@ -296,6 +310,23 @@ class MainWindow(QMainWindow):
         self._sync_project_to_active_system(project)
         return project
 
+    def _create_empty_tower_subproject(self, name: str = "Tower 1") -> Project:
+        unit = self._unit_combo.currentData() if hasattr(self, "_unit_combo") else UnitSystem.KG_M
+        return Project(
+            name=name,
+            truss_type_id=0,
+            unit_system=unit,
+            kind="tower",
+            tower_input=TowerInput(),
+            tower_result=None,
+            systems=[],
+            compare_system_ids=[],
+        )
+
+    def _is_tower_project(self, project: Optional[Project] = None) -> bool:
+        project = project or self._project
+        return bool(project and project.kind == "tower")
+
     def _create_empty_system(self, name: str, idx: int = 0) -> TrussSystem:
         return TrussSystem(
             id=str(uuid.uuid4()),
@@ -305,6 +336,11 @@ class MainWindow(QMainWindow):
         )
 
     def _ensure_project_systems(self, project: Project) -> None:
+        if self._is_tower_project(project):
+            if project.tower_input is None:
+                project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
+            project.truss_type_id = project.tower_input.truss_type_id
+            return
         if not project.systems:
             system = TrussSystem(
                 id=str(uuid.uuid4()),
@@ -356,6 +392,8 @@ class MainWindow(QMainWindow):
         project = project or self._project
         if not project:
             return []
+        if self._is_tower_project(project):
+            return []
         if project.view_mode == "compare":
             ids = set(project.compare_system_ids or [])
             return [system for system in project.systems if not ids or system.id in ids]
@@ -379,6 +417,10 @@ class MainWindow(QMainWindow):
     def _sync_project_to_active_system(self, project: Optional[Project] = None) -> None:
         project = project or self._project
         if not project:
+            return
+        if self._is_tower_project(project):
+            if project.tower_input:
+                project.truss_type_id = project.tower_input.truss_type_id
             return
         system = project.active_system
         if system is None:
@@ -428,6 +470,60 @@ class MainWindow(QMainWindow):
             cache[system.id] = truss
         return truss
 
+    def _truss_for_tower(self, project: Optional[Project] = None,
+                         idx: Optional[int] = None) -> Optional[TrussType]:
+        project = project or self._project
+        if not project or not project.tower_input or not project.tower_input.truss_type_id:
+            return None
+        cache_idx = self._active_subproject_index if idx is None else idx
+        if 0 <= cache_idx < len(self._subproject_truss_types):
+            cache = self._subproject_truss_types[cache_idx]
+            cached = cache.get(self._tower_cache_key)
+            if cached and cached.id == project.tower_input.truss_type_id:
+                return cached
+        from trusscalc.database.db_manager import load_truss_type
+        truss = load_truss_type(project.tower_input.truss_type_id)
+        if truss and 0 <= cache_idx < len(self._subproject_truss_types):
+            self._subproject_truss_types[cache_idx][self._tower_cache_key] = truss
+        return truss
+
+    def _current_project_signature(self) -> str:
+        if not self._project_bundle:
+            return ""
+        self._commit_active_subproject_state()
+        from trusscalc.database.db_manager import _bundle_to_json
+        return json.dumps(
+            {
+                "name": self._project_bundle.name,
+                "description": self._project_bundle.description,
+                "data": json.loads(_bundle_to_json(self._project_bundle)),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _reset_dirty_state(self) -> None:
+        self._saved_project_signature = self._current_project_signature()
+        self._is_dirty = False
+        self._update_window_title()
+
+    def _mark_dirty(self) -> None:
+        if not self._project_bundle:
+            return
+        if not self._is_dirty:
+            self._is_dirty = True
+            self._update_window_title()
+
+    def _has_unsaved_changes(self) -> bool:
+        if not self._project_bundle:
+            return False
+        if self._is_dirty:
+            return True
+        try:
+            return self._current_project_signature() != self._saved_project_signature
+        except Exception:
+            return True
+
     def _load_project_bundle(self, bundle: ProjectBundle) -> None:
         if not bundle.subprojects:
             bundle.subprojects.append(self._create_empty_subproject())
@@ -447,9 +543,13 @@ class MainWindow(QMainWindow):
         self._tabs.clear()
         if self._project_bundle:
             for project in self._project_bundle.subprojects:
-                self._tabs.addTab(QWidget(), project.name or "Sub-Projekt")
+                self._tabs.addTab(QWidget(), self._tab_title(project))
             self._tabs.setCurrentIndex(self._active_subproject_index)
         self._updating_tabs = False
+
+    def _tab_title(self, project: Project) -> str:
+        prefix = "Tower: " if self._is_tower_project(project) else ""
+        return prefix + (project.name or "Sub-Projekt")
 
     def _refresh_system_combo(self) -> None:
         self._system_combo.blockSignals(True)
@@ -467,6 +567,18 @@ class MainWindow(QMainWindow):
     def _refresh_active_system_ui(self) -> None:
         if not self._project:
             return
+        if self._is_tower_project():
+            if self._project.tower_input is None:
+                self._project.tower_input = TowerInput()
+            truss = self._truss_for_tower()
+            self._truss_type = truss
+            self._tower_panel.set_tower(self._project.tower_input, self._project.tower_result, truss)
+            self._props.show_project_summary(None, None)
+            self._lbl_truss.setText(
+                f"Tower: {self._project.name} | "
+                + (f"Traversentyp: {truss.display_name}" if truss else "Kein Traversentyp ausgewaehlt")
+            )
+            return
         system = self._active_system()
         self._truss_type = self._truss_for_system(system)
         self._last_result = self._system_results().get(system.id) if system else None
@@ -482,6 +594,9 @@ class MainWindow(QMainWindow):
 
     def _show_all_results(self) -> None:
         if not self._project:
+            return
+        if self._is_tower_project():
+            self._tower_panel.show_result(self._project.tower_result)
             return
         specs = {}
         for system in self._visible_systems_for_project(self._project):
@@ -500,6 +615,10 @@ class MainWindow(QMainWindow):
             return
         idx = self._active_subproject_index
         if 0 <= idx < len(self._project_bundle.subprojects):
+            if self._is_tower_project():
+                self._project.tower_input = self._tower_panel.tower_input()
+                if self._truss_type:
+                    self._subproject_truss_types[idx][self._tower_cache_key] = self._truss_type
             self._sync_project_to_active_system()
             self._project_bundle.subprojects[idx] = self._project
             system = self._active_system()
@@ -516,13 +635,23 @@ class MainWindow(QMainWindow):
         self._active_subproject_index = idx
         self._project = self._project_bundle.subprojects[idx]
         self._ensure_project_systems(self._project)
-        self._truss_type = self._truss_for_system(self._active_system())
-        self._last_result = self._system_results().get(self._project.active_system_id)
+        if self._is_tower_project():
+            self._truss_type = self._truss_for_tower(self._project, idx)
+            self._last_result = None
+        else:
+            self._truss_type = self._truss_for_system(self._active_system())
+            self._last_result = self._system_results().get(self._project.active_system_id)
         self._undo_stack = self._subproject_undo_stacks[idx]
         self._redo_stack = self._subproject_redo_stacks[idx]
         self._refresh_mode_ui()
-        self._canvas.load_project(self._project)
-        self._refresh_system_combo()
+        if self._is_tower_project():
+            self._canvas.clear_results()
+            self._work_stack.setCurrentWidget(self._tower_panel)
+            self._refresh_system_combo()
+        else:
+            self._work_stack.setCurrentWidget(self._canvas)
+            self._canvas.load_project(self._project)
+            self._refresh_system_combo()
         self._refresh_active_system_ui()
         self._update_window_title()
 
@@ -532,12 +661,15 @@ class MainWindow(QMainWindow):
         keep_copy_templates = copy.deepcopy(self._copy_templates)
         self._commit_active_subproject_state()
         self._activate_subproject(idx)
-        if keep_copy_templates:
+        if keep_copy_templates and not self._is_tower_project():
             self._copy_templates = keep_copy_templates
             self._canvas.begin_copy_mode(self._copy_templates)
             self._status.showMessage(
                 "Kopie bereit - Linksklick platziert im aktiven Tab, Rechtsklick/Esc bricht ab"
             )
+        elif self._is_tower_project():
+            self._copy_templates = []
+            self._canvas.cancel_copy_mode()
 
     def _on_tab_moved(self, from_idx: int, to_idx: int) -> None:
         if (
@@ -569,6 +701,7 @@ class MainWindow(QMainWindow):
         self._tabs.setCurrentIndex(new_active)
         self._updating_tabs = False
         self._activate_subproject(new_active)
+        self._mark_dirty()
         self._status.showMessage("Sub-Projekt-Reihenfolge aktualisiert")
 
     def _show_tab_context_menu(self, pos) -> None:
@@ -576,7 +709,9 @@ class MainWindow(QMainWindow):
         if tab_idx >= 0 and tab_idx != self._tabs.currentIndex():
             self._tabs.setCurrentIndex(tab_idx)
         menu = QMenu(self)
-        menu.addAction("Neu", self._add_subproject_tab)
+        menu.addAction("Neuer Traeger-Tab", self._add_subproject_tab)
+        menu.addAction("Neuer Tower-Tab", self._add_tower_tab)
+        menu.addSeparator()
         menu.addAction("Umbenennen", self._rename_subproject_tab)
         menu.addAction("Duplizieren", self._duplicate_subproject_tab)
         delete_action = menu.addAction("Löschen", self._delete_subproject_tab)
@@ -586,7 +721,7 @@ class MainWindow(QMainWindow):
         menu.exec(self._tabs.tabBar().mapToGlobal(pos))
 
     def _on_view_mode_changed(self, idx: int) -> None:
-        if not self._project:
+        if not self._project or self._is_tower_project():
             return
         mode = self._mode_combo.currentData() or "plan"
         if self._project.view_mode == mode:
@@ -596,6 +731,8 @@ class MainWindow(QMainWindow):
             self._copy_templates = []
             self._canvas.cancel_copy_mode()
             self._status.showMessage("Kopieren beim Moduswechsel abgebrochen")
+        was_dirty = self._is_dirty
+        saved_signature = self._saved_project_signature
         self._push_undo()
         old_mode = self._project.view_mode or "plan"
         if old_mode == "plan" and mode == "compare":
@@ -603,7 +740,10 @@ class MainWindow(QMainWindow):
         elif old_mode == "compare" and mode == "plan":
             if not self._enter_plan_mode():
                 self._undo_stack.pop()
+                self._is_dirty = was_dirty
+                self._saved_project_signature = saved_signature
                 self._refresh_mode_ui()
+                self._update_window_title()
                 return
         self._project.view_mode = mode
         self._commit_active_subproject_state()
@@ -675,6 +815,16 @@ class MainWindow(QMainWindow):
     def _refresh_mode_ui(self) -> None:
         if not self._project:
             return
+        if self._is_tower_project():
+            self._system_bar.setVisible(False)
+            self._mode_combo.setEnabled(False)
+            for act in self._tool_actions:
+                act.setEnabled(False)
+            self._canvas.set_comparison_mode(False)
+            return
+        self._mode_combo.setEnabled(True)
+        for act in self._tool_actions:
+            act.setEnabled(True)
         mode = self._project.view_mode or "plan"
         idx = self._mode_combo.findData(mode)
         self._mode_combo.blockSignals(True)
@@ -698,6 +848,23 @@ class MainWindow(QMainWindow):
         self._active_subproject_index = len(self._project_bundle.subprojects) - 1
         self._refresh_tabs()
         self._activate_subproject(self._active_subproject_index)
+        self._mark_dirty()
+
+    def _add_tower_tab(self) -> None:
+        if not self._project_bundle:
+            self._new_project()
+        name = f"Tower {len(self._project_bundle.subprojects) + 1}"
+        project = self._create_empty_tower_subproject(name)
+        self._commit_active_subproject_state()
+        self._project_bundle.subprojects.append(project)
+        self._subproject_truss_types.append({})
+        self._subproject_results.append({})
+        self._subproject_undo_stacks.append([])
+        self._subproject_redo_stacks.append([])
+        self._active_subproject_index = len(self._project_bundle.subprojects) - 1
+        self._refresh_tabs()
+        self._activate_subproject(self._active_subproject_index)
+        self._mark_dirty()
 
     def _rename_subproject_tab(self) -> None:
         if not self._project:
@@ -711,6 +878,7 @@ class MainWindow(QMainWindow):
         self._project.name = name.strip()
         self._commit_active_subproject_state()
         self._refresh_tabs()
+        self._mark_dirty()
         self._status.showMessage(f"Sub-Projekt umbenannt: {self._project.name}")
 
     def _duplicate_subproject_tab(self) -> None:
@@ -719,8 +887,11 @@ class MainWindow(QMainWindow):
         self._commit_active_subproject_state()
         clone = copy.deepcopy(self._project)
         clone.name = f"{self._project.name or 'Sub-Projekt'} Kopie"
-        self._regenerate_element_ids(clone)
-        if clone.view_mode != "compare":
+        if self._is_tower_project(clone):
+            clone.tower_result = None
+        else:
+            self._regenerate_element_ids(clone)
+        if clone.kind != "tower" and clone.view_mode != "compare":
             plan = self._system_by_id(clone.plan_system_id, clone) or clone.active_system
             if plan:
                 clone.systems = [plan]
@@ -736,6 +907,7 @@ class MainWindow(QMainWindow):
         self._active_subproject_index = idx
         self._refresh_tabs()
         self._activate_subproject(idx)
+        self._mark_dirty()
 
     def _delete_subproject_tab(self) -> None:
         if not self._project_bundle or len(self._project_bundle.subprojects) <= 1:
@@ -757,6 +929,7 @@ class MainWindow(QMainWindow):
         self._active_subproject_index = max(0, min(idx, len(self._project_bundle.subprojects) - 1))
         self._refresh_tabs()
         self._activate_subproject(self._active_subproject_index)
+        self._mark_dirty()
 
     def _on_system_changed(self, idx: int) -> None:
         if idx < 0:
@@ -767,6 +940,19 @@ class MainWindow(QMainWindow):
 
     def _on_canvas_system_selected(self, system_id: str) -> None:
         self._set_active_system(system_id)
+
+    def _on_tower_changed(self) -> None:
+        if not self._is_tower_project():
+            return
+        self._project.tower_input = self._tower_panel.tower_input()
+        self._project.truss_type_id = self._project.tower_input.truss_type_id
+        self._project.tower_result = None
+        self._mark_dirty()
+        self._commit_active_subproject_state()
+        self._lbl_truss.setText(
+            f"Tower: {self._project.name} | "
+            + (f"Traversentyp: {self._truss_type.display_name}" if self._truss_type else "Kein Traversentyp ausgewaehlt")
+        )
 
     def _add_system(self) -> None:
         if not self._project:
@@ -796,6 +982,7 @@ class MainWindow(QMainWindow):
         )
         if not ok or not name.strip():
             return
+        self._push_undo()
         system.name = name.strip()
         self._refresh_system_combo()
         self._refresh_active_system_ui()
@@ -914,6 +1101,7 @@ class MainWindow(QMainWindow):
         self._project_path = None
         self._refresh_tabs()
         self._activate_subproject(0)
+        self._reset_dirty_state()
         self._status.showMessage("Neues Projekt – Traversentyp auswählen")
 
     def _use_truss_type(self, truss: TrussType) -> None:
@@ -921,6 +1109,31 @@ class MainWindow(QMainWindow):
             self._new_project()
         if self._project is None:
             self._project = self._create_empty_subproject()
+        if self._is_tower_project():
+            if self._project.tower_input is None:
+                self._project.tower_input = TowerInput()
+            if not truss.has_weight:
+                QMessageBox.warning(
+                    self, "Eigengewicht unbekannt",
+                    f"Der Traversentyp '{truss.name}' hat kein Eigengewicht im Datenblatt.\n"
+                    "Das Eigengewicht wird in der Tower-Berechnung nicht beruecksichtigt.",
+                )
+            old_id = self._project.tower_input.truss_type_id
+            if old_id != truss.id:
+                self._push_undo()
+                self._project.tower_input.truss_type_id = truss.id or 0
+                self._project.truss_type_id = truss.id or 0
+                self._project.tower_result = None
+            self._truss_type = truss
+            self._subproject_truss_types[self._active_subproject_index][self._tower_cache_key] = truss
+            self._tower_panel.set_tower(self._project.tower_input, self._project.tower_result, truss)
+            self._commit_active_subproject_state()
+            self._refresh_active_system_ui()
+            self._refresh_tabs()
+            self._status.showMessage(
+                f"Traversentyp '{truss.display_name}' fuer Tower '{self._project.name}' ausgewaehlt"
+            )
+            return
         self._ensure_project_systems(self._project)
         system = self._active_system()
         if system is None:
@@ -946,6 +1159,13 @@ class MainWindow(QMainWindow):
                 "Das Eigengewicht wird in der Berechnung nicht berücksichtigt.",
             )
 
+        changes_project = (
+            system.truss_type_id != truss.id
+            or self._project.unit_system != self._unit_combo.currentData()
+            or not self._project.name
+        )
+        if changes_project:
+            self._push_undo()
         self._truss_type = truss
         system.truss_type_id = truss.id
         self._project.unit_system = self._unit_combo.currentData()
@@ -977,6 +1197,7 @@ class MainWindow(QMainWindow):
             return
         self._project_path = path
         self._load_project_bundle(bundle)
+        self._reset_dirty_state()
         if self._project and self._project.truss_type_id and self._truss_type is None:
             QMessageBox.warning(
                 self, "Traversentyp fehlt",
@@ -985,47 +1206,56 @@ class MainWindow(QMainWindow):
             )
         self._status.showMessage(f"Projekt '{bundle.name}' geladen ({path})")
 
-    def _save_project(self) -> None:
+    def _save_project(self) -> bool:
         if not self._project_bundle:
-            return
+            return False
         if self._project_path:
-            self._write_project_file(self._project_path)
-        else:
-            self._save_project_as()
+            return self._write_project_file(self._project_path)
+        return self._save_project_as()
 
-    def _save_project_as(self) -> None:
+    def _save_project_as(self) -> bool:
         if not self._project_bundle:
             QMessageBox.information(self, "Speichern", "Kein Projekt zum Speichern vorhanden.")
-            return
+            return False
         suggested = self._project_bundle.name or "Projekt"
         path, _ = QFileDialog.getSaveFileName(
             self, "Projekt speichern unter", f"{suggested}.tcproj",
             "TrussCalc-Projekt (*.tcproj);;JSON-Datei (*.json);;Alle Dateien (*)",
         )
         if not path:
-            return
-        # Namen ggf. aus Dateinamen ableiten
+            return False
         from pathlib import Path as _P
+        old_name = self._project_bundle.name
+        old_path = self._project_path
         if not self._project_bundle.name or self._project_bundle.name == "Projekt":
             self._project_bundle.name = _P(path).stem
-        self._project_path = path
-        self._write_project_file(path)
+        if self._write_project_file(path):
+            self._project_path = path
+            self._update_window_title()
+            return True
+        self._project_bundle.name = old_name
+        self._project_path = old_path
+        self._update_window_title()
+        return False
 
-    def _write_project_file(self, path: str) -> None:
+    def _write_project_file(self, path: str) -> bool:
         from trusscalc.database.db_manager import save_project_to_file
         try:
             self._commit_active_subproject_state()
             save_project_to_file(path, self._project_bundle)
         except Exception as exc:
             QMessageBox.critical(self, "Speichern fehlgeschlagen", str(exc))
-            return
+            return False
+        self._reset_dirty_state()
         self._update_window_title()
         self._status.showMessage(f"Projekt gespeichert: {path}")
+        return True
 
     def _update_window_title(self) -> None:
         title = "TrussCalc"
         if self._project_bundle and self._project_bundle.name:
-            title = f"TrussCalc – {self._project_bundle.name}"
+            dirty = "*" if self._is_dirty else ""
+            title = f"TrussCalc{dirty} – {self._project_bundle.name}"
             if self._project and self._project.name:
                 title += f" / {self._project.name}"
             if self._project_path:
@@ -1086,7 +1316,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Update verfuegbar", detail)
 
     def _reset_canvas(self) -> None:
-        if not self._project:
+        if not self._project or self._is_tower_project():
             return
         reply = QMessageBox.question(self, "Zurücksetzen",
                                      "Alle Elemente auf dem Canvas löschen?",
@@ -1250,7 +1480,7 @@ class MainWindow(QMainWindow):
         self._props.show_project_summary(self._project, self._truss_type)
 
     def _copy_selected(self) -> None:
-        if not self._project:
+        if not self._project or self._is_tower_project():
             return
         selected = self._canvas.selected_elements()
         if not selected:
@@ -1263,6 +1493,8 @@ class MainWindow(QMainWindow):
         )
 
     def _paste_copy(self) -> None:
+        if self._is_tower_project():
+            return
         if not self._copy_templates:
             self._copy_selected()
             return
@@ -1294,7 +1526,7 @@ class MainWindow(QMainWindow):
             self._on_edit_element(clones[0])
 
     def _mirror_selected(self) -> None:
-        if not self._project:
+        if not self._project or self._is_tower_project():
             return
         selected = self._canvas.selected_elements()
         if not selected:
@@ -1328,7 +1560,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"{len(clones)} Objekt(e) kopiert und gespiegelt")
 
     def _delete_selected(self) -> None:
-        if not self._project:
+        if not self._project or self._is_tower_project():
             return
         system = self._active_system()
         if not system:
@@ -1423,10 +1655,14 @@ class MainWindow(QMainWindow):
         self._last_result = None
         self._system_results().clear()
         self._commit_active_subproject_state()
-        self._canvas.load_project(self._project)
-        self._refresh_system_combo()
+        if self._is_tower_project():
+            self._work_stack.setCurrentWidget(self._tower_panel)
+        else:
+            self._canvas.load_project(self._project)
+            self._refresh_system_combo()
         self._refresh_active_system_ui()
         self._update_window_title()
+        self._mark_dirty()
         self._status.showMessage("Letzte Aenderung rueckgaengig gemacht")
 
     def _redo(self) -> None:
@@ -1440,10 +1676,14 @@ class MainWindow(QMainWindow):
         self._last_result = None
         self._system_results().clear()
         self._commit_active_subproject_state()
-        self._canvas.load_project(self._project)
-        self._refresh_system_combo()
+        if self._is_tower_project():
+            self._work_stack.setCurrentWidget(self._tower_panel)
+        else:
+            self._canvas.load_project(self._project)
+            self._refresh_system_combo()
         self._refresh_active_system_ui()
         self._update_window_title()
+        self._mark_dirty()
         self._status.showMessage("Aenderung wiederholt")
 
     def _push_undo(self) -> None:
@@ -1453,10 +1693,23 @@ class MainWindow(QMainWindow):
         self._redo_stack.clear()
         if len(self._undo_stack) > 50:
             self._undo_stack.pop(0)
+        self._mark_dirty()
 
     def _run_calculation(self) -> None:
         if not self._project:
             QMessageBox.warning(self, "Berechnung", "Bitte zuerst ein Projekt einrichten.")
+            return
+        if self._is_tower_project():
+            self._project.tower_input = self._tower_panel.tower_input()
+            truss = self._truss_for_tower()
+            result = tower_calculator.calculate_tower(self._project.tower_input, truss)
+            self._project.tower_result = result
+            self._truss_type = truss
+            self._tower_panel.show_result(result)
+            self._commit_active_subproject_state()
+            self._status.showMessage(
+                f"Tower berechnet: Status {result.status}, Kippauslastung {result.tipping_utilization * 100:.0f}%"
+            )
             return
         valid_systems = []
         missing = []
@@ -1511,11 +1764,22 @@ class MainWindow(QMainWindow):
         )
 
     def _clear_results(self) -> None:
+        if self._is_tower_project():
+            self._project.tower_result = None
+            self._tower_panel.show_result(None)
+            self._commit_active_subproject_state()
+            return
         system = self._active_system()
         self._clear_system_result(system.id if system else None)
         self._commit_active_subproject_state()
 
     def _clear_all_results_in_tab(self) -> None:
+        if self._is_tower_project():
+            self._project.tower_result = None
+            self._tower_panel.show_result(None)
+            self._commit_active_subproject_state()
+            self._status.showMessage("Tower-Ergebnis geloescht")
+            return
         self._last_result = None
         self._system_results().clear()
         self._canvas.clear_results()
@@ -1524,15 +1788,20 @@ class MainWindow(QMainWindow):
         self._status.showMessage("Alle Ergebnisse im aktuellen Tab geloescht")
 
     def _fit_view(self) -> None:
+        if self._is_tower_project():
+            return
         self._canvas.fit_view(all_systems=False)
 
     def _fit_all_view(self) -> None:
+        if self._is_tower_project():
+            return
         self._canvas.fit_view(all_systems=True)
 
     # ── Einheiten ─────────────────────────────────────────────────────────────
 
     def _on_unit_changed(self, idx: int) -> None:
         unit = self._unit_combo.currentData()
+        old_unit = self._project_bundle.unit_system if self._project_bundle else None
         if self._project_bundle:
             self._project_bundle.unit_system = unit
             for project in self._project_bundle.subprojects:
@@ -1541,9 +1810,12 @@ class MainWindow(QMainWindow):
             self._project.unit_system = unit
         self._props.set_unit_system(unit)
         if self._project:
-            self._canvas.load_project(self._project)
-            self._show_all_results()
+            if not self._is_tower_project():
+                self._canvas.load_project(self._project)
+                self._show_all_results()
             self._refresh_active_system_ui()
+        if old_unit is not None and old_unit != unit:
+            self._mark_dirty()
 
     # ── PDF-Import & Traversenverwaltung ──────────────────────────────────────
 
@@ -1781,6 +2053,31 @@ class MainWindow(QMainWindow):
         chapters = []
         missing = []
         for idx, project in enumerate(self._project_bundle.subprojects):
+            if self._is_tower_project(project):
+                if project.tower_input is None:
+                    project.tower_input = TowerInput()
+                truss_type = self._truss_for_tower(project, idx)
+                result = project.tower_result
+                if result is None:
+                    try:
+                        result = tower_calculator.calculate_tower(project.tower_input, truss_type)
+                        project.tower_result = result
+                    except Exception:
+                        result = None
+                if result and result.is_valid:
+                    chapters.append({
+                        "kind": "tower",
+                        "project": copy.deepcopy(project),
+                        "truss_type": copy.deepcopy(truss_type) if truss_type else None,
+                        "result": copy.deepcopy(result),
+                        "tower_input": copy.deepcopy(project.tower_input),
+                        "sub_project_name": project.name,
+                        "system_name": "",
+                        "view_mode": "tower",
+                    })
+                else:
+                    missing.append(project.name or f"Tower {idx + 1}")
+                continue
             self._ensure_project_systems(project)
             if export_mode == "compare":
                 ids = set(project.compare_system_ids or [])
@@ -1810,12 +2107,15 @@ class MainWindow(QMainWindow):
                         f"{project.name} / {system.name}"
                         if export_mode == "compare" else project.name
                     )
-                    chapters.append((
-                        idx, report_project, truss_type, result,
-                        project.name,
-                        system.name if export_mode == "compare" else "",
-                        export_mode,
-                    ))
+                    chapters.append({
+                        "kind": "beam",
+                        "project": report_project,
+                        "truss_type": truss_type,
+                        "result": result,
+                        "sub_project_name": project.name,
+                        "system_name": system.name if export_mode == "compare" else "",
+                        "view_mode": export_mode,
+                    })
                 else:
                     missing.append(
                         f"{project.name or f'Sub-Projekt {idx + 1}'}"
@@ -1874,15 +2174,19 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         from trusscalc.database.db_manager import load_truss_pdf
         report_chapters = []
-        for _idx, project, truss_type, result, sub_name, system_name, view_mode in chapters:
+        for chapter in chapters:
+            truss_type = chapter.get("truss_type")
+            datasheet = load_truss_pdf(truss_type.id) if truss_type and truss_type.id else None
             report_chapters.append({
-                "project": copy.deepcopy(project),
-                "truss_type": copy.deepcopy(truss_type),
-                "result": copy.deepcopy(result),
-                "datasheet_pdf_bytes": load_truss_pdf(truss_type.id),
-                "sub_project_name": sub_name,
-                "system_name": system_name,
-                "view_mode": view_mode,
+                "kind": chapter.get("kind", "beam"),
+                "project": copy.deepcopy(chapter["project"]),
+                "truss_type": copy.deepcopy(truss_type) if truss_type else None,
+                "result": copy.deepcopy(chapter["result"]),
+                "tower_input": copy.deepcopy(chapter.get("tower_input")),
+                "datasheet_pdf_bytes": datasheet,
+                "sub_project_name": chapter.get("sub_project_name", ""),
+                "system_name": chapter.get("system_name", ""),
+                "view_mode": chapter.get("view_mode", export_mode),
             })
 
         class _PdfWorker(QThread):
@@ -2000,6 +2304,34 @@ class MainWindow(QMainWindow):
         """)
 
     # ── Hilfsmethoden ────────────────────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        if not self._has_unsaved_changes():
+            event.accept()
+            return
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setWindowTitle("Änderungen speichern?")
+        msg.setText("Das Projekt wurde geändert.")
+        msg.setInformativeText("Möchten Sie die Änderungen vor dem Schließen speichern?")
+        save_btn = msg.addButton("Speichern", QMessageBox.ButtonRole.AcceptRole)
+        discard_btn = msg.addButton("Nicht speichern", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = msg.addButton("Abbrechen", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(save_btn)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked is save_btn:
+            event.accept() if self._save_project() else event.ignore()
+            return
+        if clicked is discard_btn:
+            event.accept()
+            return
+        if clicked is cancel_btn:
+            event.ignore()
+            return
+        event.ignore()
 
     def _action(self, label: str, slot, shortcut: str = "") -> QAction:
         act = QAction(label, self)

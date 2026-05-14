@@ -45,6 +45,7 @@ class TrussCanvas(QGraphicsView):
     paste_requested = pyqtSignal()
     mirror_requested = pyqtSignal()
     delete_requested = pyqtSignal()
+    project_changed = pyqtSignal()
     request_support_dialog = pyqtSignal(float)          # Position in m
     request_point_load_dialog = pyqtSignal(float)
     request_dist_load_dialog = pyqtSignal(float, float) # start_m, end_m
@@ -531,6 +532,8 @@ class TrussCanvas(QGraphicsView):
                 if self._systems_overlap(system):
                     system.canvas_x_m = old_x
                     system.canvas_y_m = old_y
+                else:
+                    self.project_changed.emit()
                 self._rebuild_scene()
             event.accept()
             return

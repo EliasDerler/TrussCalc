@@ -31,7 +31,7 @@ from reportlab.graphics import renderPDF
 from reportlab.pdfgen import canvas as _canvas
 
 from trusscalc.core.models import (
-    Project, TrussType, CalculationResult,
+    Project, TrussType, CalculationResult, TowerInput, TowerResult,
 )
 from trusscalc.pdf.i18n import tr
 
@@ -39,7 +39,9 @@ PAGE_W, PAGE_H = A4
 MARGIN = 1.8 * cm
 
 
-def _truss_report_name(truss_type: TrussType) -> str:
+def _truss_report_name(truss_type: TrussType | None) -> str:
+    if truss_type is None:
+        return "Kein Traversentyp"
     return truss_type.name or truss_type.display_name
 
 # ── Farbpalette (NoiseGate-Branding) ───────────────────────────────────────
@@ -241,6 +243,97 @@ def generate_report(
         _append_datasheet(path, datasheet_pdf_bytes)
 
 
+def generate_tower_report(
+    path: str,
+    project: Project,
+    truss_type: TrussType | None,
+    tower_input: TowerInput,
+    result: TowerResult,
+    metadata=None,
+    include_notice_signature: bool = True,
+    show_tower_height_in_header: bool = True,
+) -> None:
+    """Erzeugt ein Tower-Kapitel für die Projekt-PDF-Ausgabe."""
+    if metadata is None:
+        from trusscalc.ui.dialogs.report_metadata_dialog import ReportMetadata
+        metadata = ReportMetadata(
+            language="de",
+            project_name=project.name or "Tower",
+            sub_project_name="",
+            creator_email="info@noisegate.at",
+        )
+    styles = _styles(metadata.language)
+    doc = BaseDocTemplate(
+        str(path), pagesize=A4,
+        leftMargin=0, rightMargin=0,
+        topMargin=0, bottomMargin=0,
+        title=metadata.project_name,
+        author=metadata.creator_email or "TrussCalc",
+    )
+    frame_first = Frame(
+        MARGIN, 1.2 * cm,
+        PAGE_W - 2 * MARGIN, PAGE_H - 1.2 * cm,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+        id="tower_first",
+    )
+    frame_later = Frame(
+        MARGIN, 1.5 * cm,
+        PAGE_W - 2 * MARGIN, PAGE_H - 3.0 * cm,
+        leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+        id="tower_later",
+    )
+    doc.addPageTemplates([
+        PageTemplate(id="tower_first", frames=frame_first),
+        PageTemplate(id="tower_later", frames=frame_later),
+    ])
+
+    status_text = {
+        "green": "OK",
+        "yellow": "Prüfen",
+        "red": "Kritisch",
+    }.get(result.status, result.status)
+    status_color = {
+        "green": STATUS_OK,
+        "yellow": STATUS_WARN,
+        "red": STATUS_OVER,
+    }.get(result.status, TEXT_MUTED)
+    truss_name = _truss_report_name(truss_type) if truss_type else "Kein Traversentyp"
+    title = metadata.project_name or project.name or "Tower"
+    subtitle = metadata.sub_project_name or project.name or "Tower"
+
+    story = [
+        _HeaderBand(
+            title, subtitle, truss_type, project, metadata.language,
+            tower_height_m=tower_input.height_m if show_tower_height_in_header else None,
+        ),
+        Spacer(1, 0.45 * cm),
+        _section_header(1, "Tower-Vorbemessung", "Einzeltower in einer Kraftrichtung", styles),
+        Spacer(1, 0.2 * cm),
+        _tower_summary_table(tower_input, result, truss_name, status_text, status_color, styles),
+        Spacer(1, 0.55 * cm),
+        _section_header(2, "2D-Visualisierung", "Kräfte, Bemaßungen und Kopfversatz", styles),
+        Spacer(1, 0.2 * cm),
+        _tower_schema_card(tower_input, result),
+        NextPageTemplate("tower_later"),
+        PageBreak(),
+        _section_header(3, "Eingaben", "Geometrie, Lasten, Fundament und Anschluss", styles),
+        Spacer(1, 0.2 * cm),
+        _tower_input_table(tower_input, truss_name, styles),
+        Spacer(1, 0.55 * cm),
+        _section_header(4, "Ergebnisse", "Standsicherheit, Ballastbedarf und Anschlusskräfte", styles),
+        Spacer(1, 0.2 * cm),
+        _tower_result_table(tower_input, result, styles),
+        Spacer(1, 0.35 * cm),
+        _tower_notice_box(result, styles),
+    ]
+    if include_notice_signature:
+        story.extend([Spacer(1, 0.5 * cm), _signature_block(metadata.language, styles)])
+
+    footer = _make_footer_drawer(metadata, metadata.language)
+    doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
+        *a, footer_drawer=footer, **kw))
+
+
 def generate_project_report(path: str, chapters: list[dict], metadata=None) -> None:
     """Erzeugt ein Gesamt-PDF aus mehreren Sub-Projekt-Reports.
 
@@ -285,16 +378,28 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
                     sub_project_name=sub_name,
                 )
                 chapter_path = os.path.join(tmp_dir, f"chapter_{idx:03d}.pdf")
-                generate_report(
-                    path=chapter_path,
-                    project=project,
-                    truss_type=chapter["truss_type"],
-                    result=chapter["result"],
-                    datasheet_pdf_bytes=None,
-                    metadata=chapter_meta,
-                    include_partlist=not multi,
-                    include_notice_signature=not multi,
-                )
+                if chapter.get("kind") == "tower":
+                    generate_tower_report(
+                        path=chapter_path,
+                        project=project,
+                        truss_type=chapter.get("truss_type"),
+                        tower_input=chapter["tower_input"],
+                        result=chapter["result"],
+                        metadata=chapter_meta,
+                        include_notice_signature=not multi,
+                        show_tower_height_in_header=(len(chapters) == 1),
+                    )
+                else:
+                    generate_report(
+                        path=chapter_path,
+                        project=project,
+                        truss_type=chapter["truss_type"],
+                        result=chapter["result"],
+                        datasheet_pdf_bytes=None,
+                        metadata=chapter_meta,
+                        include_partlist=not multi,
+                        include_notice_signature=not multi,
+                    )
                 chapter_paths.append(chapter_path)
             if multi:
                 closing_path = os.path.join(tmp_dir, "closing.pdf")
@@ -417,13 +522,14 @@ class _HeaderBand(Flowable):
     HEIGHT = 8.75 * cm
 
     def __init__(self, title: str, subtitle: str, truss_type: TrussType,
-                 project: Project, lang: str) -> None:
+                 project: Project, lang: str, tower_height_m: float | None = None) -> None:
         super().__init__()
         self.title = title
         self.subtitle = subtitle
         self.truss_type = truss_type
         self.project = project
         self.lang = lang
+        self.tower_height_m = tower_height_m
 
     def wrap(self, avail_w: float, avail_h: float):
         # Layoutgröße = Frame-Breite, gezeichnet wird über translate aber bis
@@ -527,14 +633,18 @@ class _HeaderBand(Flowable):
 
         # 3 Spalten Metadaten unten (Software ist in die Fußzeile gewandert,
         # damit TRAVERSENTYP genug Platz für lange Namen hat)
+        length_label = tr(self.lang, "total_length")
+        length_value = f"{self.project.total_length_m * 100:.0f} cm"
+        if self.tower_height_m is not None:
+            length_label = "Gesamthöhe" if self.lang == "de" else "Total height"
+            length_value = f"{self.tower_height_m * 100:.0f} cm"
         cols = [
             (tr(self.lang, "date"),
              datetime.datetime.now().strftime("%d.%m.%Y, %H:%M"),
              0.24),  # Anteil der Innenbreite
             (tr(self.lang, "software"), SOFTWARE_VERSION, 0.24),
             (tr(self.lang, "truss_type"), _truss_report_name(self.truss_type), 0.34),
-            (tr(self.lang, "total_length"),
-             f"{self.project.total_length_m * 100:.0f} cm", 0.18),
+            (length_label, length_value, 0.18),
         ]
         cur_x = inner_x
         for label, value, frac in cols:
@@ -1478,6 +1588,19 @@ def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> T
         head.insert(1, tr(lang, "col_system"))
     rows = [head]
     for idx, chapter in enumerate(chapters, start=1):
+        if chapter.get("kind") == "tower":
+            sub_name = chapter.get("sub_project_name") or f"Tower {idx}"
+            truss_type = chapter.get("truss_type")
+            row = [
+                sub_name,
+                f"{chapter.get('tower_input').height_m * 100:.0f} cm",
+                _truss_report_name(truss_type) if truss_type else "Tower-Traverse",
+                "1",
+            ]
+            if include_system:
+                row.insert(1, "")
+            rows.append(row)
+            continue
         project = chapter["project"]
         truss_type = chapter["truss_type"]
         sub_name = chapter.get("sub_project_name") or project.name or f"Sub-Projekt {idx}"
@@ -1539,6 +1662,315 @@ def _combined_partlist_table(chapters: list[dict], lang: str, styles: dict) -> T
             style.append(("BACKGROUND", (0, row_idx), (-1, row_idx), TABLE_ROW_ALT))
     tbl.setStyle(TableStyle(style))
     return tbl
+
+
+def _tower_summary_table(data: TowerInput, result: TowerResult, truss_name: str,
+                         status_text: str, status_color, styles: dict) -> Table:
+    uses_connector = data.foundation.type == "concrete_socket"
+    connector_title = "Schraubenauslastung" if uses_connector else "Bodenplatte"
+    connector_value = (
+        f"{result.bolt_utilization * 100:.0f} %"
+        if uses_connector
+        else "fix verbunden"
+    )
+    connector_value_style = (
+        styles["card_value"] if uses_connector else ParagraphStyle(
+            "tc_tower_connector_small",
+            parent=styles["card_value"],
+            fontSize=12,
+            leading=14,
+        )
+    )
+    connector_detail = (
+        f"T {result.bolt_tension_kn:.2f} kN / V {result.bolt_shear_kn:.2f} kN"
+        if uses_connector
+        else "ohne Schrauben-Näherung"
+    )
+    rows = [[
+        Paragraph("<b>Status</b>", styles["body_muted"]),
+        Paragraph("<b>Kippauslastung</b>", styles["body_muted"]),
+        Paragraph(f"<b>{connector_title}</b>", styles["body_muted"]),
+        Paragraph("<b>Ballastbedarf</b>", styles["body_muted"]),
+    ], [
+        Paragraph(status_text, ParagraphStyle(
+            "tc_tower_status", fontName="Helvetica-Bold", fontSize=18,
+            leading=22, textColor=status_color,
+        )),
+        Paragraph(f"{result.tipping_utilization * 100:.0f} %", styles["card_value"]),
+        Paragraph(connector_value, connector_value_style),
+        Paragraph(_kg_or_inf(result.required_ballast_kg), styles["card_value"]),
+    ], [
+        Paragraph(truss_name, styles["body_muted"]),
+        Paragraph(f"MEd {result.design_moment_knm:.2f} kNm", styles["body_muted"]),
+        Paragraph(connector_detail, styles["body_muted"]),
+        Paragraph(f"Fh,max {result.max_horizontal_force_kn:.2f} kN", styles["body_muted"]),
+    ]]
+    inner_w = PAGE_W - 2 * MARGIN
+    tbl = Table(rows, colWidths=[inner_w * 0.23] * 4)
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), CARD_BG),
+        ("BOX", (0, 0), (-1, -1), 0.6, CARD_BORDER),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, CARD_BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    return tbl
+
+
+def _tower_input_table(data: TowerInput, truss_name: str, styles: dict) -> Table:
+    f = data.foundation
+    c = data.connector
+    uses_connector = f.type == "concrete_socket"
+    foundation_type = "Beton-Sockel" if f.type == "concrete_socket" else "Stahl-Bodenplatte"
+    rows = [
+        ["Traversentyp", truss_name],
+        ["Tower-Höhe", f"{data.height_m:.2f} m"],
+        ["Horizontalkraft [Fh] / Angriffshöhe [hF]", f"{data.horizontal_force_kn:.2f} kN @ {data.force_height_m:.2f} m"],
+        ["Zuladung / Exzentrizität", f"{data.payload_kg:.1f} kg @ {data.payload_eccentricity_m:.2f} m"],
+        ["Sicherheitsfaktor", f"{data.gamma:.2f}"],
+        ["Fundament", foundation_type],
+        ["Fundament B x T / Gewicht", f"{f.width_m:.2f} x {f.depth_m:.2f} m / {f.weight_kg:.1f} kg"],
+        ["Ballast / Abstand", f"{f.ballast_kg:.1f} kg / {f.ballast_offset_m:.2f} m"],
+    ]
+    if uses_connector:
+        rows.extend([
+            ["Spiel / Einstecktiefe", f"{f.clearance_mm:.1f} mm / {f.insertion_depth_m:.2f} m"],
+            ["Schrauben", f"{c.bolt_count} Stk., Hebelarm {c.bolt_lever_arm_m:.2f} m"],
+            ["Zulässig je Schraube", f"Zug {c.allowable_tension_kn:.2f} kN, Quer {c.allowable_shear_kn:.2f} kN"],
+        ])
+    else:
+        rows.append(["Anschluss", "Bodenplatte fix verbunden"])
+    return _key_value_table(rows, styles)
+
+
+def _tower_result_table(data: TowerInput, result: TowerResult, styles: dict) -> Table:
+    uses_connector = data.foundation.type == "concrete_socket"
+    rows = [
+        ["Bemessungsmoment", f"{result.design_moment_knm:.2f} kNm"],
+        ["Standmoment", f"{result.resisting_moment_knm:.2f} kNm"],
+        ["Kippauslastung", f"{result.tipping_utilization * 100:.0f} %"],
+        ["Max. Horizontalkraft Fh,max", f"{result.max_horizontal_force_kn:.2f} kN"],
+        ["Zusätzlicher Ballastbedarf", _kg_or_inf(result.required_ballast_kg)],
+        ["Kantenkraft Fk", f"{result.edge_force_kn * 1000.0:.0f} N"],
+        ["Basis-Druckkraft", f"{result.base_compression_kg * 9.80665 / 1000.0:.2f} kN"],
+        ["Tower-Eigengewicht", f"{result.tower_self_weight_kg:.1f} kg"],
+    ]
+    if uses_connector:
+        rows.extend([
+            ["Schraubenzug je belasteter Schraube", f"{result.bolt_tension_kn:.2f} kN"],
+            ["Schraubenquerkraft je Schraube", f"{result.bolt_shear_kn:.2f} kN"],
+            ["Schraubenauslastung", f"{result.bolt_utilization * 100:.0f} %"],
+            ["Kopfversatz durch Spiel", f"{result.top_offset_mm:.1f} mm"],
+        ])
+    else:
+        rows.append(["Anschluss", "Bodenplatte fix verbunden"])
+    rows.extend([
+        ["Biegung Tower", f"{result.bending_deflection_mm:.1f} mm"],
+        ["Gesamt-Kopfversatz", f"{result.total_top_displacement_mm:.1f} mm"],
+    ])
+    return _key_value_table(rows, styles)
+
+
+def _tower_schema_card(data: TowerInput, result: TowerResult) -> Flowable:
+    return _TowerSchemaFlowable(data, result)
+
+
+class _TowerSchemaFlowable(Flowable):
+    def __init__(self, data: TowerInput, result: TowerResult) -> None:
+        super().__init__()
+        self.data = data
+        self.result = result
+
+    def wrap(self, avail_w, avail_h):
+        self.width = avail_w
+        self.height = 10.0 * cm
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        w, h = self.width, self.height
+        c.setFillColor(CARD_BG)
+        c.roundRect(0, 0, w, h, CARD_RADIUS, fill=1, stroke=0)
+        c.setStrokeColor(CARD_BORDER)
+        c.roundRect(0, 0, w, h, CARD_RADIUS, fill=0, stroke=1)
+
+        data = self.data
+        result = self.result
+        status_color = {
+            "green": STATUS_OK,
+            "yellow": STATUS_WARN,
+            "red": STATUS_OVER,
+        }.get(result.status, TEXT_MUTED)
+
+        cx = w * 0.50
+        base_y = 1.15 * cm
+        top_y = h - 1.25 * cm
+        tower_h = max(top_y - base_y, 1)
+        foundation_w = max(2.4 * cm, min(5.2 * cm, data.foundation.width_m / 2.0 * 5.2 * cm))
+
+        c.setFillColor(HexColor("#585858"))
+        c.rect(cx - foundation_w / 2, 0.55 * cm, foundation_w, 0.62 * cm, fill=1, stroke=0)
+        chord = 0.18 * cm
+        c.setStrokeColor(TEXT_DARK)
+        c.setLineWidth(2.2)
+        c.line(cx - chord, base_y, cx - chord, top_y)
+        c.line(cx + chord, base_y, cx + chord, top_y)
+        c.setStrokeColor(TEXT_MUTED)
+        c.setLineWidth(0.7)
+        y = base_y + 0.4 * cm
+        flip = False
+        while y < top_y - 0.2 * cm:
+            if flip:
+                c.line(cx + chord, y, cx - chord, y + 0.32 * cm)
+            else:
+                c.line(cx - chord, y, cx + chord, y + 0.32 * cm)
+            c.line(cx - chord, y, cx + chord, y)
+            y += 0.55 * cm
+            flip = not flip
+
+        c.setFillColor(HexColor("#4B4B4B"))
+        c.rect(cx - 1.45 * cm, top_y - 0.08 * cm, 2.9 * cm, 0.18 * cm, fill=1, stroke=0)
+        payload_x = cx + max(-1.8 * cm, min(1.8 * cm, data.payload_eccentricity_m * 0.9 * cm))
+
+        force_y = self._y_for_height(data.force_height_m, data.height_m, top_y, base_y)
+        self._arrow(c, cx - 2.0 * cm, force_y, cx - 0.62 * cm, force_y,
+                    TEAL if result.status == "green" else status_color,
+                    f"Fh {data.horizontal_force_kn:.2f} kN", label_dy=0.16 * cm)
+        self._arrow(c, payload_x, top_y + 0.95 * cm, payload_x, top_y + 0.38 * cm,
+                    HexColor("#B8872B"), f"{data.payload_kg:.0f} kg", label_dx=0.08 * cm)
+        edge_x = cx - foundation_w / 2 - 0.48 * cm
+        self._arrow(c, edge_x, base_y + 0.18 * cm,
+                    edge_x, base_y + 0.78 * cm,
+                    status_color, f"Fk {result.edge_force_kn * 1000.0:.0f} N",
+                    label_dx=-1.08 * cm, label_dy=0.03 * cm)
+        self._arrow(c, cx + foundation_w / 2 + 0.58 * cm, base_y + 0.68 * cm,
+                    cx + foundation_w / 2 + 0.58 * cm, base_y + 0.12 * cm,
+                    status_color, f"Rz {result.base_compression_kg * 9.80665 / 1000.0:.2f} kN",
+                    label_dx=-1.05 * cm, label_dy=0.05 * cm)
+
+        if data.foundation.type == "concrete_socket":
+            c.setStrokeColor(status_color)
+            c.setLineWidth(1.5)
+            c.line(cx - 0.45 * cm, base_y + 0.05 * cm, cx - 0.82 * cm, base_y + 0.62 * cm)
+            c.line(cx + 0.45 * cm, base_y + 0.05 * cm, cx + 0.82 * cm, base_y + 0.62 * cm)
+            c.setFillColor(status_color)
+            c.setFont("Helvetica", 8)
+            c.drawString(cx + 0.95 * cm, base_y + 0.48 * cm, f"T {result.bolt_tension_kn:.2f} kN")
+
+        self._dimension(c, cx + foundation_w / 2 + 0.5 * cm, top_y,
+                        cx + foundation_w / 2 + 0.5 * cm, base_y,
+                        f"H {data.height_m:.2f} m", vertical=True)
+        self._dimension(c, cx - foundation_w / 2, 0.22 * cm,
+                        cx + foundation_w / 2, 0.22 * cm,
+                        f"B {data.foundation.width_m:.2f} m", vertical=False)
+        self._dimension(c, cx + 0.65 * cm, force_y, cx + 0.65 * cm, base_y,
+                        f"hF {data.force_height_m:.2f} m", vertical=True)
+        if abs(data.payload_eccentricity_m) > 0.01:
+            self._dimension(c, cx, top_y + 0.72 * cm, payload_x, top_y + 0.72 * cm,
+                            f"e {data.payload_eccentricity_m:.2f} m", vertical=False)
+
+        c.setFillColor(TEXT_DARK)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(0.55 * cm, h - 0.65 * cm, f"MEd {result.design_moment_knm:.2f} kNm")
+        c.drawString(0.55 * cm, h - 1.05 * cm, f"Kopfversatz {result.total_top_displacement_mm:.1f} mm")
+
+        bend = min(1.0 * cm, max(0.15 * cm, result.total_top_displacement_mm / 50.0 * cm))
+        if result.total_top_displacement_mm > 0:
+            c.setStrokeColor(status_color)
+            c.setLineWidth(1.4)
+            c.setDash(4, 3)
+            path = c.beginPath()
+            path.moveTo(cx, base_y)
+            path.curveTo(cx + bend * 0.2, base_y + tower_h * 0.35,
+                         cx + bend * 0.8, top_y - tower_h * 0.35,
+                         cx + bend, top_y)
+            c.drawPath(path, stroke=1, fill=0)
+            c.setDash()
+
+    def _y_for_height(self, value: float, height_m: float, top_y: float, base_y: float) -> float:
+        if height_m <= 0:
+            return base_y
+        ratio = max(0.0, min(1.0, value / height_m))
+        return base_y + ratio * (top_y - base_y)
+
+    def _arrow(self, c, x1, y1, x2, y2, color, label, label_dx=0, label_dy=0.1 * cm):
+        c.setStrokeColor(color)
+        c.setFillColor(color)
+        c.setLineWidth(1.4)
+        c.line(x1, y1, x2, y2)
+        dx = x2 - x1
+        dy = y2 - y1
+        length = max((dx * dx + dy * dy) ** 0.5, 1)
+        ux, uy = dx / length, dy / length
+        size = 0.12 * cm
+        p1 = (x2, y2)
+        p2 = (x2 - ux * size - uy * size * 0.55, y2 - uy * size + ux * size * 0.55)
+        p3 = (x2 - ux * size + uy * size * 0.55, y2 - uy * size - ux * size * 0.55)
+        head = c.beginPath()
+        head.moveTo(p1[0], p1[1])
+        head.lineTo(p2[0], p2[1])
+        head.lineTo(p3[0], p3[1])
+        head.close()
+        c.drawPath(head, stroke=0, fill=1)
+        c.setFont("Helvetica", 8)
+        c.drawString(min(x1, x2) + label_dx, max(y1, y2) + label_dy, label)
+
+    def _dimension(self, c, x1, y1, x2, y2, label, vertical: bool):
+        c.setStrokeColor(TEXT_LIGHT)
+        c.setLineWidth(0.5)
+        c.setDash(1, 2)
+        c.line(x1, y1, x2, y2)
+        c.setDash()
+        c.setFillColor(TEXT_MUTED)
+        c.setFont("Helvetica", 7.5)
+        if vertical:
+            c.drawString(x1 + 0.12 * cm, (y1 + y2) / 2, label)
+        else:
+            c.drawCentredString((x1 + x2) / 2, y1 + 0.08 * cm, label)
+
+
+def _key_value_table(rows: list[list[str]], styles: dict) -> Table:
+    table_rows = [
+        [Paragraph(str(k), styles["body_muted"]), Paragraph(str(v), styles["body"])]
+        for k, v in rows
+    ]
+    inner_w = PAGE_W - 2 * MARGIN
+    tbl = Table(table_rows, colWidths=[inner_w * 0.42, inner_w * 0.58])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("TEXTCOLOR", (0, 0), (-1, -1), TEXT_DARK),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.3, CARD_BORDER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    return tbl
+
+
+def _tower_notice_box(result: TowerResult, styles: dict) -> Flowable:
+    warnings = " ".join(result.warnings)
+    return _NoticeBox(
+        title="Wichtiger Tower-Hinweis",
+        text=(
+            "Diese Tower-Berechnung ist eine Vorbemessung und kein "
+            "prüffähiger Standsicherheitsnachweis. Herstellerangaben, "
+            "Verbindungsmittel, Untergrund, dynamische Lasten und lokale "
+            f"Vorschriften sind separat zu prüfen. {warnings}"
+        ),
+    )
+
+
+def _kg_or_inf(value: float) -> str:
+    if value == float("inf"):
+        return "nicht bestimmbar"
+    return f"{value:.1f} kg"
 
 
 def _build_project_closing_pdf(path: str, chapters: list[dict], metadata) -> None:

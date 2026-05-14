@@ -104,6 +104,67 @@ class DistributedLoad:
 
 
 @dataclass
+class TowerFoundation:
+    """Fundamentdaten fuer einen freistehenden Tower."""
+    type: str = "steel_plate"  # steel_plate | concrete_socket
+    width_m: float = 1.0
+    depth_m: float = 1.0
+    weight_kg: float = 120.0
+    ballast_kg: float = 0.0
+    ballast_offset_m: float = 0.0
+    clearance_mm: float = 0.0
+    insertion_depth_m: float = 0.5
+
+
+@dataclass
+class TowerConnector:
+    """Manuelle Verbinder-/Schraubenwerte fuer die Tower-Vorbemessung."""
+    bolt_count: int = 4
+    bolt_lever_arm_m: float = 0.25
+    allowable_tension_kn: float = 5.0
+    allowable_shear_kn: float = 5.0
+
+
+@dataclass
+class TowerInput:
+    """Eingaben fuer einen freistehenden Einzeltower."""
+    truss_type_id: int = 0
+    height_m: float = 4.0
+    horizontal_force_kn: float = 1.0
+    force_height_m: float = 4.0
+    payload_kg: float = 0.0
+    payload_eccentricity_m: float = 0.0
+    gamma: float = 1.30
+    foundation: TowerFoundation = field(default_factory=TowerFoundation)
+    connector: TowerConnector = field(default_factory=TowerConnector)
+
+
+@dataclass
+class TowerResult:
+    """Ergebnis der Tower-Vorbemessung."""
+    design_moment_knm: float
+    resisting_moment_knm: float
+    tipping_utilization: float
+    required_ballast_kg: float
+    tower_self_weight_kg: float
+    total_vertical_load_kg: float
+    base_shear_kn: float
+    base_compression_kg: float
+    bolt_tension_kn: float
+    bolt_shear_kn: float
+    bolt_utilization: float
+    top_offset_mm: float
+    bending_deflection_mm: float
+    total_top_displacement_mm: float
+    status: str
+    warnings: list[str] = field(default_factory=list)
+    is_valid: bool = True
+    max_horizontal_force_kn: float = 0.0
+    edge_force_kn: float = 0.0
+    edge_force_kg: float = 0.0
+
+
+@dataclass
 class TrussSystem:
     """Ein statisch unabhaengiges Traversensystem innerhalb eines Sub-Projekts."""
     name: str
@@ -201,6 +262,9 @@ class Project:
     plan_system_id: Optional[str] = None
     compare_system_ids: list[str] = field(default_factory=list)
     view_mode: str = "plan"
+    kind: str = "beam"  # beam | tower
+    tower_input: Optional[TowerInput] = None
+    tower_result: Optional[TowerResult] = None
     unit_system: UnitSystem = UnitSystem.KG_M
     description: str = ""
     id: Optional[int] = None
