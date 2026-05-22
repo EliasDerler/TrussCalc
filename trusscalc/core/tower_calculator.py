@@ -59,6 +59,12 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
     gamma = max(data.gamma, 0.0)
     horizontal_kn = max(data.horizontal_force_kn, 0.0)
     force_height = max(data.force_height_m, 0.0)
+    horizontal_direction = -1 if data.horizontal_force_direction < 0 else 1
+    signed_horizontal_moment = (
+        data.horizontal_moment_knm
+        if abs(data.horizontal_moment_knm) > 1e-9
+        else horizontal_direction * horizontal_kn * force_height
+    )
     payload_kg = max(data.payload_kg, 0.0)
     payload_ecc = data.payload_eccentricity_m
 
@@ -77,11 +83,13 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
     total_vertical = foundation_weight + ballast_kg + payload_kg + tower_self_weight
 
     base_lever = max(foundation.width_m, 0.0) / 2.0
-    ballast_lever = max(base_lever + foundation.ballast_offset_m, 0.0)
-    payload_lever = base_lever - payload_ecc
+    signed_service_moment = signed_horizontal_moment + payload_kn * payload_ecc
+    moment_direction = -1 if signed_service_moment < 0 else 1
+    ballast_lever = max(base_lever - moment_direction * foundation.ballast_offset_m, 0.0)
+    payload_lever = base_lever - moment_direction * payload_ecc
     payload_resisting_moment = payload_kn * max(payload_lever, 0.0)
     payload_overturning_moment = payload_kn * max(-payload_lever, 0.0)
-    design_moment = gamma * (horizontal_kn * force_height + payload_overturning_moment)
+    design_moment = gamma * (abs(signed_horizontal_moment) + payload_overturning_moment)
 
     center_weight_kg = foundation_weight + tower_self_weight
     resisting_moment = (
@@ -126,7 +134,7 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
     edge_force_kn = 0.0
     edge_force_kg = 0.0
     if foundation.width_m > 0:
-        edge_force_kn = design_moment / foundation.width_m
+        edge_force_kn = gamma * abs(signed_service_moment) / foundation.width_m
         edge_force_kg = edge_force_kn * 1000.0 / GRAVITY
 
     top_offset = 0.0
@@ -151,6 +159,7 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
         gamma=gamma,
         warnings=warnings,
     )
+    cantilever_deflection = max(data.cantilever_deflection_mm, 0.0)
     total_top_displacement = top_offset + bending_deflection
 
     if not is_valid:
@@ -162,6 +171,7 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
         or bolt_util > 0.8
         or top_offset > 20.0
         or total_top_displacement > 20.0
+        or cantilever_deflection > 20.0
     ):
         status = "yellow"
     else:
@@ -188,6 +198,8 @@ def calculate_tower(data: TowerInput, truss_type: TrussType | None = None) -> To
         max_horizontal_force_kn=max_horizontal_force,
         edge_force_kn=edge_force_kn,
         edge_force_kg=edge_force_kg,
+        moment_direction=moment_direction,
+        cantilever_deflection_mm=cantilever_deflection,
     )
 
 

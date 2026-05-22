@@ -126,14 +126,84 @@ class TowerConnector:
 
 
 @dataclass
+class TowerFoundationPreset:
+    """Manuell gepflegter Fundament-Bibliothekseintrag."""
+    name: str
+    foundation: TowerFoundation = field(default_factory=TowerFoundation)
+    connector: TowerConnector = field(default_factory=TowerConnector)
+    id: Optional[int] = None
+
+
+@dataclass
+class TowerAssemblySection:
+    """Vertikaler Traversenabschnitt eines gezeichneten Einzeltowers."""
+    length_m: float
+    truss_type_id: int
+    position_m: float = 0.0
+    id: Optional[str] = None
+
+
+@dataclass
+class TowerAssemblyCantilever:
+    """Horizontale Auskragung links oder rechts am Tower."""
+    height_m: float
+    side: str  # left | right
+    length_m: float
+    truss_type_id: int
+    id: Optional[str] = None
+
+
+@dataclass
+class TowerAssemblyLoad:
+    """Punktkraft in der Tower-Seitenansicht."""
+    height_m: float
+    direction: str  # horizontal | vertical
+    value: float    # horizontal = kN, vertical = kg
+    eccentricity_m: float = 0.0
+    x_m: float = 0.0
+    id: Optional[str] = None
+
+
+@dataclass
+class TowerAssembly:
+    """Zeichnungsbasierter Einzeltower: Fundament, Stack und Punktkraefte."""
+    foundation_name: str = ""
+    foundation_source_id: Optional[int] = None
+    foundation: Optional[TowerFoundation] = None
+    connector: TowerConnector = field(default_factory=TowerConnector)
+    sections: list[TowerAssemblySection] = field(default_factory=list)
+    cantilevers: list[TowerAssemblyCantilever] = field(default_factory=list)
+    point_loads: list[TowerAssemblyLoad] = field(default_factory=list)
+    gamma: float = 1.30
+
+    @property
+    def height_m(self) -> float:
+        return sum(max(section.length_m, 0.0) for section in self.sections)
+
+    @property
+    def truss_type_ids(self) -> list[int]:
+        ids: list[int] = []
+        for section in self.sections:
+            if section.truss_type_id and section.truss_type_id not in ids:
+                ids.append(section.truss_type_id)
+        for cantilever in self.cantilevers:
+            if cantilever.truss_type_id and cantilever.truss_type_id not in ids:
+                ids.append(cantilever.truss_type_id)
+        return ids
+
+
+@dataclass
 class TowerInput:
     """Eingaben fuer einen freistehenden Einzeltower."""
     truss_type_id: int = 0
     height_m: float = 4.0
     horizontal_force_kn: float = 1.0
     force_height_m: float = 4.0
+    horizontal_force_direction: int = 1
+    horizontal_moment_knm: float = 0.0
     payload_kg: float = 0.0
     payload_eccentricity_m: float = 0.0
+    cantilever_deflection_mm: float = 0.0
     gamma: float = 1.30
     foundation: TowerFoundation = field(default_factory=TowerFoundation)
     connector: TowerConnector = field(default_factory=TowerConnector)
@@ -162,6 +232,8 @@ class TowerResult:
     max_horizontal_force_kn: float = 0.0
     edge_force_kn: float = 0.0
     edge_force_kg: float = 0.0
+    moment_direction: int = 1
+    cantilever_deflection_mm: float = 0.0
 
 
 @dataclass
@@ -264,6 +336,7 @@ class Project:
     view_mode: str = "plan"
     kind: str = "beam"  # beam | tower
     tower_input: Optional[TowerInput] = None
+    tower_assembly: Optional[TowerAssembly] = None
     tower_result: Optional[TowerResult] = None
     unit_system: UnitSystem = UnitSystem.KG_M
     description: str = ""

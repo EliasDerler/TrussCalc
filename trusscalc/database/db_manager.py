@@ -9,8 +9,10 @@ from trusscalc.core.models import (
     TrussType, LoadTableEntry, LoadType, TrussSource, Project,
     ProjectBundle, TrussSystem, TrussSection, Support, PointLoad,
     DistributedLoad, UnitSystem, TowerInput, TowerFoundation,
-    TowerConnector, TowerResult,
+    TowerConnector, TowerResult, TowerFoundationPreset, TowerAssembly,
+    TowerAssemblySection, TowerAssemblyLoad, TowerAssemblyCantilever,
 )
+from trusscalc.core.tower_assembly import assembly_from_tower_input, refresh_section_positions
 
 _DB_PATH = Path(os.environ.get("TRUSSCALC_DB", "trusscalc.db"))
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -192,6 +194,106 @@ def load_truss_pdf(truss_type_id: int) -> Optional[bytes]:
         return row["pdf_data"] if row else None
 
 
+# -- Tower-Fundamente ---------------------------------------------------------
+
+def save_tower_foundation(preset: TowerFoundationPreset) -> int:
+    foundation = preset.foundation
+    connector = preset.connector
+    with get_connection() as conn:
+        if preset.id is None:
+            cur = conn.execute(
+                """INSERT INTO tower_foundations
+                   (name, type, width_m, depth_m, weight_kg, ballast_kg,
+                    ballast_offset_m, clearance_mm, insertion_depth_m,
+                    bolt_count, bolt_lever_arm_m, allowable_tension_kn,
+                    allowable_shear_kn)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    preset.name,
+                    foundation.type,
+                    foundation.width_m,
+                    foundation.depth_m,
+                    foundation.weight_kg,
+                    foundation.ballast_kg,
+                    foundation.ballast_offset_m,
+                    foundation.clearance_mm,
+                    foundation.insertion_depth_m,
+                    connector.bolt_count,
+                    connector.bolt_lever_arm_m,
+                    connector.allowable_tension_kn,
+                    connector.allowable_shear_kn,
+                ),
+            )
+            preset.id = cur.lastrowid
+        else:
+            conn.execute(
+                """UPDATE tower_foundations
+                   SET name=?, type=?, width_m=?, depth_m=?, weight_kg=?,
+                       ballast_kg=?, ballast_offset_m=?, clearance_mm=?,
+                       insertion_depth_m=?, bolt_count=?, bolt_lever_arm_m=?,
+                       allowable_tension_kn=?, allowable_shear_kn=?,
+                       modified_at=CURRENT_TIMESTAMP
+                   WHERE id=?""",
+                (
+                    preset.name,
+                    foundation.type,
+                    foundation.width_m,
+                    foundation.depth_m,
+                    foundation.weight_kg,
+                    foundation.ballast_kg,
+                    foundation.ballast_offset_m,
+                    foundation.clearance_mm,
+                    foundation.insertion_depth_m,
+                    connector.bolt_count,
+                    connector.bolt_lever_arm_m,
+                    connector.allowable_tension_kn,
+                    connector.allowable_shear_kn,
+                    preset.id,
+                ),
+            )
+    return preset.id
+
+
+def load_tower_foundation(preset_id: int) -> Optional[TowerFoundationPreset]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM tower_foundations WHERE id=?", (preset_id,)).fetchone()
+        return _row_to_tower_foundation(row) if row else None
+
+
+def list_tower_foundations() -> list[TowerFoundationPreset]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM tower_foundations ORDER BY name").fetchall()
+        return [_row_to_tower_foundation(row) for row in rows]
+
+
+def delete_tower_foundation(preset_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM tower_foundations WHERE id=?", (preset_id,))
+
+
+def _row_to_tower_foundation(row: sqlite3.Row) -> TowerFoundationPreset:
+    return TowerFoundationPreset(
+        id=row["id"],
+        name=row["name"],
+        foundation=TowerFoundation(
+            type=row["type"],
+            width_m=float(row["width_m"]),
+            depth_m=float(row["depth_m"]),
+            weight_kg=float(row["weight_kg"]),
+            ballast_kg=float(row["ballast_kg"]),
+            ballast_offset_m=float(row["ballast_offset_m"]),
+            clearance_mm=float(row["clearance_mm"]),
+            insertion_depth_m=float(row["insertion_depth_m"]),
+        ),
+        connector=TowerConnector(
+            bolt_count=int(row["bolt_count"]),
+            bolt_lever_arm_m=float(row["bolt_lever_arm_m"]),
+            allowable_tension_kn=float(row["allowable_tension_kn"]),
+            allowable_shear_kn=float(row["allowable_shear_kn"]),
+        ),
+    )
+
+
 # ── Projekte ──────────────────────────────────────────────────────────────────
 
 def save_project(project: Project | ProjectBundle) -> int:
@@ -303,8 +405,11 @@ def _tower_input_to_dict(data: TowerInput | None) -> dict | None:
         "height_m": data.height_m,
         "horizontal_force_kn": data.horizontal_force_kn,
         "force_height_m": data.force_height_m,
+        "horizontal_force_direction": data.horizontal_force_direction,
+        "horizontal_moment_knm": data.horizontal_moment_knm,
         "payload_kg": data.payload_kg,
         "payload_eccentricity_m": data.payload_eccentricity_m,
+        "cantilever_deflection_mm": data.cantilever_deflection_mm,
         "gamma": data.gamma,
         "foundation": {
             "type": data.foundation.type,
@@ -334,8 +439,11 @@ def _dict_to_tower_input(data: dict | None) -> TowerInput:
         height_m=float(data.get("height_m", 4.0)),
         horizontal_force_kn=float(data.get("horizontal_force_kn", 1.0)),
         force_height_m=float(data.get("force_height_m", data.get("height_m", 4.0))),
+        horizontal_force_direction=int(data.get("horizontal_force_direction", 1)),
+        horizontal_moment_knm=float(data.get("horizontal_moment_knm", 0.0)),
         payload_kg=float(data.get("payload_kg", 0.0)),
         payload_eccentricity_m=float(data.get("payload_eccentricity_m", 0.0)),
+        cantilever_deflection_mm=float(data.get("cantilever_deflection_mm", 0.0)),
         gamma=float(data.get("gamma", 1.30)),
         foundation=TowerFoundation(
             type=foundation_data.get("type", "steel_plate"),
@@ -354,6 +462,143 @@ def _dict_to_tower_input(data: dict | None) -> TowerInput:
             allowable_shear_kn=float(connector_data.get("allowable_shear_kn", 5.0)),
         ),
     )
+
+
+def _foundation_to_dict(data: TowerFoundation | None) -> dict | None:
+    if data is None:
+        return None
+    return {
+        "type": data.type,
+        "width_m": data.width_m,
+        "depth_m": data.depth_m,
+        "weight_kg": data.weight_kg,
+        "ballast_kg": data.ballast_kg,
+        "ballast_offset_m": data.ballast_offset_m,
+        "clearance_mm": data.clearance_mm,
+        "insertion_depth_m": data.insertion_depth_m,
+    }
+
+
+def _dict_to_foundation(data: dict | None) -> TowerFoundation | None:
+    if data is None:
+        return None
+    return TowerFoundation(
+        type=data.get("type", "steel_plate"),
+        width_m=float(data.get("width_m", 1.0)),
+        depth_m=float(data.get("depth_m", 1.0)),
+        weight_kg=float(data.get("weight_kg", 0.0)),
+        ballast_kg=float(data.get("ballast_kg", 0.0)),
+        ballast_offset_m=float(data.get("ballast_offset_m", 0.0)),
+        clearance_mm=float(data.get("clearance_mm", 0.0)),
+        insertion_depth_m=float(data.get("insertion_depth_m", 0.5)),
+    )
+
+
+def _connector_to_dict(data: TowerConnector | None) -> dict:
+    data = data or TowerConnector()
+    return {
+        "bolt_count": data.bolt_count,
+        "bolt_lever_arm_m": data.bolt_lever_arm_m,
+        "allowable_tension_kn": data.allowable_tension_kn,
+        "allowable_shear_kn": data.allowable_shear_kn,
+    }
+
+
+def _dict_to_connector(data: dict | None) -> TowerConnector:
+    data = data or {}
+    return TowerConnector(
+        bolt_count=int(data.get("bolt_count", 4)),
+        bolt_lever_arm_m=float(data.get("bolt_lever_arm_m", 0.25)),
+        allowable_tension_kn=float(data.get("allowable_tension_kn", 5.0)),
+        allowable_shear_kn=float(data.get("allowable_shear_kn", 5.0)),
+    )
+
+
+def _tower_assembly_to_dict(data: TowerAssembly | None) -> dict | None:
+    if data is None:
+        return None
+    refresh_section_positions(data)
+    return {
+        "foundation_name": data.foundation_name,
+        "foundation_source_id": data.foundation_source_id,
+        "foundation": _foundation_to_dict(data.foundation),
+        "connector": _connector_to_dict(data.connector),
+        "gamma": data.gamma,
+        "sections": [
+            {
+                "id": section.id,
+                "length_m": section.length_m,
+                "position_m": section.position_m,
+                "truss_type_id": section.truss_type_id,
+            }
+            for section in data.sections
+        ],
+        "cantilevers": [
+            {
+                "id": cantilever.id,
+                "height_m": cantilever.height_m,
+                "side": cantilever.side,
+                "length_m": cantilever.length_m,
+                "truss_type_id": cantilever.truss_type_id,
+            }
+            for cantilever in data.cantilevers
+        ],
+        "point_loads": [
+            {
+                "id": load.id,
+                "height_m": load.height_m,
+                "direction": load.direction,
+                "value": load.value,
+                "eccentricity_m": load.eccentricity_m,
+                "x_m": getattr(load, "x_m", load.eccentricity_m),
+            }
+            for load in data.point_loads
+        ],
+    }
+
+
+def _dict_to_tower_assembly(data: dict | None, fallback: TowerInput | None = None) -> TowerAssembly:
+    if not data:
+        return assembly_from_tower_input(fallback)
+    assembly = TowerAssembly(
+        foundation_name=data.get("foundation_name", ""),
+        foundation_source_id=data.get("foundation_source_id"),
+        foundation=_dict_to_foundation(data.get("foundation")),
+        connector=_dict_to_connector(data.get("connector")),
+        gamma=float(data.get("gamma", 1.30)),
+        sections=[
+            TowerAssemblySection(
+                id=section.get("id"),
+                length_m=float(section.get("length_m", 0.0)),
+                position_m=float(section.get("position_m", 0.0)),
+                truss_type_id=int(section.get("truss_type_id") or 0),
+            )
+            for section in data.get("sections", [])
+        ],
+        cantilevers=[
+            TowerAssemblyCantilever(
+                id=cantilever.get("id"),
+                height_m=float(cantilever.get("height_m", 0.0)),
+                side=cantilever.get("side", "right"),
+                length_m=float(cantilever.get("length_m", 0.0)),
+                truss_type_id=int(cantilever.get("truss_type_id") or 0),
+            )
+            for cantilever in data.get("cantilevers", [])
+        ],
+        point_loads=[
+            TowerAssemblyLoad(
+                id=load.get("id"),
+                height_m=float(load.get("height_m", 0.0)),
+                direction=load.get("direction", "horizontal"),
+                value=float(load.get("value", 0.0)),
+                eccentricity_m=float(load.get("eccentricity_m", 0.0)),
+                x_m=float(load.get("x_m", load.get("eccentricity_m", 0.0))),
+            )
+            for load in data.get("point_loads", [])
+        ],
+    )
+    refresh_section_positions(assembly)
+    return assembly
 
 
 def _tower_result_to_dict(result: TowerResult | None) -> dict | None:
@@ -380,6 +625,8 @@ def _tower_result_to_dict(result: TowerResult | None) -> dict | None:
         "max_horizontal_force_kn": result.max_horizontal_force_kn,
         "edge_force_kn": result.edge_force_kn,
         "edge_force_kg": result.edge_force_kg,
+        "moment_direction": result.moment_direction,
+        "cantilever_deflection_mm": result.cantilever_deflection_mm,
     }
 
 
@@ -417,6 +664,8 @@ def _dict_to_tower_result(data: dict | None) -> TowerResult | None:
             )
         ),
         edge_force_kg=float(data.get("edge_force_kg", 0.0)),
+        moment_direction=int(data.get("moment_direction", 1)),
+        cantilever_deflection_mm=float(data.get("cantilever_deflection_mm", 0.0)),
     )
 
 
@@ -471,6 +720,10 @@ def _json_to_project(data: str, pid: int, name: str, desc: str) -> Project:
         view_mode=d.get("view_mode", "plan"),
         kind=d.get("kind", "beam"),
         tower_input=_dict_to_tower_input(d.get("tower_input")) if d.get("kind") == "tower" else None,
+        tower_assembly=_dict_to_tower_assembly(
+            d.get("tower_assembly"),
+            _dict_to_tower_input(d.get("tower_input")) if d.get("kind") == "tower" else None,
+        ) if d.get("kind") == "tower" else None,
         tower_result=_dict_to_tower_result(d.get("tower_result")),
     )
     if not project.systems and (
@@ -495,6 +748,7 @@ def _project_to_dict_v2(project: Project) -> dict:
     data["view_mode"] = project.view_mode
     data["systems"] = [_system_to_dict(system) for system in project.systems]
     data["tower_input"] = _tower_input_to_dict(project.tower_input)
+    data["tower_assembly"] = _tower_assembly_to_dict(project.tower_assembly)
     data["tower_result"] = _tower_result_to_dict(project.tower_result)
     return data
 
@@ -513,7 +767,7 @@ def _ensure_bundle(project: Project | ProjectBundle) -> ProjectBundle:
 
 def _bundle_to_json(bundle: ProjectBundle) -> str:
     return json.dumps({
-        "format_version": 4,
+        "format_version": 6,
         "unit_system": bundle.unit_system.value,
         "subprojects": [_project_to_dict_v2(p) for p in bundle.subprojects],
     }, ensure_ascii=False)
@@ -529,6 +783,10 @@ def _dict_to_project_v2(data: dict, name: str = "", desc: str = "") -> Project:
     project.kind = data.get("kind", "beam")
     if project.kind == "tower":
         project.tower_input = _dict_to_tower_input(data.get("tower_input"))
+        project.tower_assembly = _dict_to_tower_assembly(
+            data.get("tower_assembly"),
+            project.tower_input,
+        )
         project.tower_result = _dict_to_tower_result(data.get("tower_result"))
         project.truss_type_id = project.tower_input.truss_type_id
     return project
@@ -562,6 +820,8 @@ def _json_to_bundle(data: str, pid: int, name: str, desc: str) -> ProjectBundle:
         project.kind = project.kind or "beam"
         if project.kind == "tower" and project.tower_input is None:
             project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
+        if project.kind == "tower" and project.tower_assembly is None:
+            project.tower_assembly = assembly_from_tower_input(project.tower_input)
         project.unit_system = unit
         _ensure_project_systems(project)
     return ProjectBundle(
@@ -577,7 +837,7 @@ def save_project_to_file(path: str, project: Project | ProjectBundle) -> None:
     """Speichert ein Projekt als eigenständige .tcproj-Datei (JSON v3)."""
     bundle = _ensure_bundle(project)
     payload = {
-        "format_version": 4,
+        "format_version": 6,
         "name": bundle.name,
         "description": bundle.description,
         "data": json.loads(_bundle_to_json(bundle)),
@@ -618,6 +878,8 @@ def _ensure_project_systems(project: Project) -> None:
     if getattr(project, "kind", "beam") == "tower":
         if project.tower_input is None:
             project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
+        if project.tower_assembly is None:
+            project.tower_assembly = assembly_from_tower_input(project.tower_input)
         project.truss_type_id = project.tower_input.truss_type_id
         return
     if not project.systems:

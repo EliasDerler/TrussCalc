@@ -10,6 +10,7 @@ import os
 import tempfile
 from collections import Counter
 from dataclasses import replace
+from io import BytesIO
 from typing import Optional
 
 from reportlab.lib.pagesizes import A4
@@ -31,9 +32,11 @@ from reportlab.graphics import renderPDF
 from reportlab.pdfgen import canvas as _canvas
 
 from trusscalc.core.models import (
-    Project, TrussType, CalculationResult, TowerInput, TowerResult,
+    Project, TrussType, CalculationResult, TowerAssembly, TowerInput, TowerResult,
 )
+from trusscalc.core.tower_assembly import cantilever_deflections_mm
 from trusscalc.pdf.i18n import tr
+from trusscalc.version import APP_VERSION
 
 PAGE_W, PAGE_H = A4
 MARGIN = 1.8 * cm
@@ -69,7 +72,7 @@ STATUS_LIFT = HexColor("#4488FF")
 NOTICE_BG = HexColor("#FEF8E1")
 NOTICE_BORDER = HexColor("#F0A500")
 
-SOFTWARE_VERSION = "TrussCalc v2.4.1"
+SOFTWARE_VERSION = f"TrussCalc v{APP_VERSION}"
 CARD_RADIUS = 6
 
 
@@ -132,6 +135,7 @@ def generate_report(
     metadata=None,
     include_partlist: bool = True,
     include_notice_signature: bool = True,
+    numbered_footer: bool = True,
 ) -> None:
     """Erzeugt den PDF-Report. ``metadata`` ist ein ReportMetadata-Dataclass."""
     path = str(path)
@@ -233,10 +237,12 @@ def generate_report(
         story.append(_signature_block(lang, styles))
 
     # Footer-Drawer benötigt Daten → Closure
-    footer = _make_footer_drawer(metadata, lang)
-
-    doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
-        *a, footer_drawer=footer, **kw))
+    if numbered_footer:
+        footer = _make_footer_drawer(metadata, lang)
+        doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
+            *a, footer_drawer=footer, **kw))
+    else:
+        doc.build(story)
 
     # Datenblatt anhängen
     if datasheet_pdf_bytes:
@@ -250,8 +256,10 @@ def generate_tower_report(
     tower_input: TowerInput,
     result: TowerResult,
     metadata=None,
+    tower_assembly: TowerAssembly | None = None,
     include_notice_signature: bool = True,
     show_tower_height_in_header: bool = True,
+    numbered_footer: bool = True,
 ) -> None:
     """Erzeugt ein Tower-Kapitel für die Projekt-PDF-Ausgabe."""
     if metadata is None:
@@ -313,12 +321,12 @@ def generate_tower_report(
         Spacer(1, 0.55 * cm),
         _section_header(2, "2D-Visualisierung", "Kräfte, Bemaßungen und Kopfversatz", styles),
         Spacer(1, 0.2 * cm),
-        _tower_schema_card(tower_input, result),
+        _tower_schema_card(tower_input, result, tower_assembly, truss_type),
         NextPageTemplate("tower_later"),
         PageBreak(),
         _section_header(3, "Eingaben", "Geometrie, Lasten, Fundament und Anschluss", styles),
         Spacer(1, 0.2 * cm),
-        _tower_input_table(tower_input, truss_name, styles),
+        _tower_input_table(tower_input, truss_name, styles, tower_assembly),
         Spacer(1, 0.55 * cm),
         _section_header(4, "Ergebnisse", "Standsicherheit, Ballastbedarf und Anschlusskräfte", styles),
         Spacer(1, 0.2 * cm),
@@ -329,9 +337,12 @@ def generate_tower_report(
     if include_notice_signature:
         story.extend([Spacer(1, 0.5 * cm), _signature_block(metadata.language, styles)])
 
-    footer = _make_footer_drawer(metadata, metadata.language)
-    doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
-        *a, footer_drawer=footer, **kw))
+    if numbered_footer:
+        footer = _make_footer_drawer(metadata, metadata.language)
+        doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
+            *a, footer_drawer=footer, **kw))
+    else:
+        doc.build(story)
 
 
 def generate_project_report(path: str, chapters: list[dict], metadata=None) -> None:
@@ -386,8 +397,10 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
                         tower_input=chapter["tower_input"],
                         result=chapter["result"],
                         metadata=chapter_meta,
+                        tower_assembly=chapter.get("tower_assembly"),
                         include_notice_signature=not multi,
-                        show_tower_height_in_header=(len(chapters) == 1),
+                        show_tower_height_in_header=True,
+                        numbered_footer=not multi,
                     )
                 else:
                     generate_report(
@@ -399,11 +412,12 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
                         metadata=chapter_meta,
                         include_partlist=not multi,
                         include_notice_signature=not multi,
+                        numbered_footer=not multi,
                     )
                 chapter_paths.append(chapter_path)
             if multi:
                 closing_path = os.path.join(tmp_dir, "closing.pdf")
-                _build_project_closing_pdf(closing_path, chapters, metadata)
+                _build_project_closing_pdf(closing_path, chapters, metadata, numbered_footer=False)
                 chapter_paths.append(closing_path)
 
             merged = pymupdf.open()
@@ -414,6 +428,8 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
                         merged.insert_pdf(chapter_doc)
                     finally:
                         chapter_doc.close()
+                if multi:
+                    _draw_global_footer_on_pdf(merged, metadata, metadata.language)
                 appended_datasheets = set()
                 for chapter in chapters:
                     datasheet_bytes = chapter.get("datasheet_pdf_bytes")
@@ -442,6 +458,46 @@ def generate_project_report(path: str, chapters: list[dict], metadata=None) -> N
             except OSError:
                 pass
         raise
+
+
+def _draw_global_footer_on_pdf(pdf_doc, metadata, lang: str) -> None:
+    """Zeichnet eine globale Fußzeile auf ein bereits zusammengeführtes PDF."""
+    try:
+        import pymupdf
+    except Exception:
+        return
+    total_pages = pdf_doc.page_count
+    if total_pages <= 0:
+        return
+    company = tr(lang, "company_address")
+    email = metadata.creator_email or ""
+    color = (0x6C / 255.0, 0x77 / 255.0, 0x85 / 255.0)
+    font = "helv"
+    size = 8
+    for idx, page in enumerate(pdf_doc, start=1):
+        rect = page.rect
+        right_x = rect.width - MARGIN
+        base_y = rect.height - 1.0 * cm
+        page_y = base_y - 11
+        page_str = tr(lang, "page_of", p=idx, total=total_pages)
+        page_w = pymupdf.get_text_length(page_str, fontname=font, fontsize=size)
+        page.insert_text((MARGIN, base_y), company, fontsize=size, fontname=font, color=color)
+        page.insert_text(
+            (right_x - page_w, page_y),
+            page_str,
+            fontsize=size,
+            fontname=font,
+            color=color,
+        )
+        if email:
+            email_w = pymupdf.get_text_length(email, fontname=font, fontsize=size)
+            page.insert_text(
+                (right_x - email_w, base_y),
+                email,
+                fontsize=size,
+                fontname=font,
+                color=color,
+            )
 
 
 # ── Styles ─────────────────────────────────────────────────────────────────
@@ -1720,7 +1776,12 @@ def _tower_summary_table(data: TowerInput, result: TowerResult, truss_name: str,
     return tbl
 
 
-def _tower_input_table(data: TowerInput, truss_name: str, styles: dict) -> Table:
+def _tower_input_table(
+    data: TowerInput,
+    truss_name: str,
+    styles: dict,
+    assembly: TowerAssembly | None = None,
+) -> Table:
     f = data.foundation
     c = data.connector
     uses_connector = f.type == "concrete_socket"
@@ -1728,7 +1789,10 @@ def _tower_input_table(data: TowerInput, truss_name: str, styles: dict) -> Table
     rows = [
         ["Traversentyp", truss_name],
         ["Tower-Höhe", f"{data.height_m:.2f} m"],
-        ["Horizontalkraft [Fh] / Angriffshöhe [hF]", f"{data.horizontal_force_kn:.2f} kN @ {data.force_height_m:.2f} m"],
+        [
+            "Horizontalkraft [Fh] / Angriffshöhe [hF]",
+            f"{data.horizontal_force_kn:.2f} kN @ {data.force_height_m:.2f} m, Richtung {'links' if data.horizontal_force_direction < 0 else 'rechts'}",
+        ],
         ["Zuladung / Exzentrizität", f"{data.payload_kg:.1f} kg @ {data.payload_eccentricity_m:.2f} m"],
         ["Sicherheitsfaktor", f"{data.gamma:.2f}"],
         ["Fundament", foundation_type],
@@ -1743,6 +1807,21 @@ def _tower_input_table(data: TowerInput, truss_name: str, styles: dict) -> Table
         ])
     else:
         rows.append(["Anschluss", "Bodenplatte fix verbunden"])
+    if assembly and assembly.cantilevers:
+        for idx, cantilever in enumerate(assembly.cantilevers, start=1):
+            side = "links" if cantilever.side == "left" else "rechts"
+            rows.append([
+                f"Auskragung {idx}",
+                f"{side}, {cantilever.length_m:.2f} m @ Oberkante {cantilever.height_m:.2f} m",
+            ])
+    if assembly and assembly.point_loads:
+        for idx, load in enumerate(assembly.point_loads, start=1):
+            if load.direction == "horizontal":
+                side = "rechts" if load.x_m > 0 else "links"
+                detail = f"Fh {load.value:.2f} kN @ {load.height_m:.2f} m, Seite {side}"
+            else:
+                detail = f"{load.value:.1f} kg @ H {load.height_m:.2f} m, X {load.x_m:.2f} m"
+            rows.append([f"Punktlast {idx}", detail])
     return _key_value_table(rows, styles)
 
 
@@ -1769,20 +1848,34 @@ def _tower_result_table(data: TowerInput, result: TowerResult, styles: dict) -> 
         rows.append(["Anschluss", "Bodenplatte fix verbunden"])
     rows.extend([
         ["Biegung Tower", f"{result.bending_deflection_mm:.1f} mm"],
+        ["Biegung Auskragung", f"{result.cantilever_deflection_mm:.1f} mm"],
         ["Gesamt-Kopfversatz", f"{result.total_top_displacement_mm:.1f} mm"],
     ])
     return _key_value_table(rows, styles)
 
 
-def _tower_schema_card(data: TowerInput, result: TowerResult) -> Flowable:
-    return _TowerSchemaFlowable(data, result)
+def _tower_schema_card(
+    data: TowerInput,
+    result: TowerResult,
+    assembly: TowerAssembly | None = None,
+    truss_type: TrussType | None = None,
+) -> Flowable:
+    return _TowerSchemaFlowable(data, result, assembly, truss_type)
 
 
 class _TowerSchemaFlowable(Flowable):
-    def __init__(self, data: TowerInput, result: TowerResult) -> None:
+    def __init__(
+        self,
+        data: TowerInput,
+        result: TowerResult,
+        assembly: TowerAssembly | None = None,
+        truss_type: TrussType | None = None,
+    ) -> None:
         super().__init__()
         self.data = data
         self.result = result
+        self.assembly = assembly
+        self.truss_type = truss_type
 
     def wrap(self, avail_w, avail_h):
         self.width = avail_w
@@ -1796,6 +1889,8 @@ class _TowerSchemaFlowable(Flowable):
         c.roundRect(0, 0, w, h, CARD_RADIUS, fill=1, stroke=0)
         c.setStrokeColor(CARD_BORDER)
         c.roundRect(0, 0, w, h, CARD_RADIUS, fill=0, stroke=1)
+        if self._draw_ui_canvas_image(c, w, h):
+            return
 
         data = self.data
         result = self.result
@@ -1805,7 +1900,9 @@ class _TowerSchemaFlowable(Flowable):
             "red": STATUS_OVER,
         }.get(result.status, TEXT_MUTED)
 
-        cx = w * 0.50
+        pad = 0.55 * cm
+        label_rects: list[tuple[float, float, float, float]] = []
+        cx = w * 0.43
         base_y = 1.15 * cm
         top_y = h - 1.25 * cm
         tower_h = max(top_y - base_y, 1)
@@ -1813,7 +1910,10 @@ class _TowerSchemaFlowable(Flowable):
 
         c.setFillColor(HexColor("#585858"))
         c.rect(cx - foundation_w / 2, 0.55 * cm, foundation_w, 0.62 * cm, fill=1, stroke=0)
+        label_rects.append((cx - foundation_w / 2 - 3, 0.55 * cm - 3, foundation_w + 6, 0.62 * cm + 6))
         chord = 0.18 * cm
+        label_rects.append((cx - chord - 5, base_y - 5, chord * 2 + 10, tower_h + 10))
+        label_rects.append((0.55 * cm - 2, h - 1.08 * cm - 2, 4.2 * cm, 0.62 * cm))
         c.setStrokeColor(TEXT_DARK)
         c.setLineWidth(2.2)
         c.line(cx - chord, base_y, cx - chord, top_y)
@@ -1831,25 +1931,110 @@ class _TowerSchemaFlowable(Flowable):
             y += 0.55 * cm
             flip = not flip
 
-        c.setFillColor(HexColor("#4B4B4B"))
-        c.rect(cx - 1.45 * cm, top_y - 0.08 * cm, 2.9 * cm, 0.18 * cm, fill=1, stroke=0)
-        payload_x = cx + max(-1.8 * cm, min(1.8 * cm, data.payload_eccentricity_m * 0.9 * cm))
+        max_left = max((arm.length_m for arm in self.assembly.cantilevers if arm.side == "left"), default=0.0) if self.assembly else 0.0
+        max_right = max((arm.length_m for arm in self.assembly.cantilevers if arm.side != "left"), default=0.0) if self.assembly else 0.0
+        right_force_lane_x = w - 3.05 * cm
+        right_dimension_x = w - 1.45 * cm
+        hforce_dimension_x = w - 2.45 * cm
+        drawing_right = right_force_lane_x - 0.75 * cm
+        left_capacity = max(cx - 1.15 * cm, 0.8 * cm)
+        right_capacity = max(drawing_right - cx, 0.8 * cm)
+        x_scale = 0.9 * cm
+        if max_left > 0:
+            x_scale = min(x_scale, left_capacity / max_left)
+        if max_right > 0:
+            x_scale = min(x_scale, right_capacity / max_right)
+        if self.assembly:
+            cantilever_draw_specs = []
+            for cantilever in self.assembly.cantilevers:
+                arm_top_y = self._y_for_height(cantilever.height_m, data.height_m, top_y, base_y)
+                arm_y = arm_top_y - 0.16 * cm
+                arm_len = max(0.35 * cm, cantilever.length_m * x_scale)
+                if cantilever.side == "left":
+                    x1, x2 = cx - chord, cx - chord - arm_len
+                else:
+                    x1, x2 = cx + chord, cx + chord + arm_len
+                self._draw_horizontal_truss(c, x1, x2, arm_y)
+                label_rects.append((min(x1, x2) - 3, arm_y - 0.19 * cm, abs(x2 - x1) + 6, 0.38 * cm))
+                cantilever_draw_specs.append((cantilever, x1, x2, arm_y))
+            self._draw_cantilever_deflections(c, cantilever_draw_specs, x_scale, status_color, label_rects)
+
+        payload_x = cx + max(-2.4 * cm, min(2.4 * cm, data.payload_eccentricity_m * x_scale))
 
         force_y = self._y_for_height(data.force_height_m, data.height_m, top_y, base_y)
-        self._arrow(c, cx - 2.0 * cm, force_y, cx - 0.62 * cm, force_y,
-                    TEAL if result.status == "green" else status_color,
-                    f"Fh {data.horizontal_force_kn:.2f} kN", label_dy=0.16 * cm)
-        self._arrow(c, payload_x, top_y + 0.95 * cm, payload_x, top_y + 0.38 * cm,
-                    HexColor("#B8872B"), f"{data.payload_kg:.0f} kg", label_dx=0.08 * cm)
-        edge_x = cx - foundation_w / 2 - 0.48 * cm
+        force_color = TEAL if result.status == "green" else status_color
+        horizontal_loads = [
+            load for load in (self.assembly.point_loads if self.assembly else [])
+            if load.direction == "horizontal" and load.value > 0
+        ]
+        if horizontal_loads:
+            for load in horizontal_loads:
+                load_y = self._y_for_height(load.height_m, data.height_m, top_y, base_y)
+                if load.x_m > 0:
+                    self._arrow(c, cx + 2.0 * cm, load_y, cx + 0.62 * cm, load_y, force_color)
+                    self._placed_label(
+                        c, f"Fh {load.value:.2f} kN", right_force_lane_x, load_y + 0.18 * cm,
+                        force_color, label_rects, min_y=base_y + 1.0 * cm, max_y=top_y - 0.15 * cm,
+                        leader_to=(cx + 1.1 * cm, load_y),
+                    )
+                else:
+                    self._arrow(c, cx - 2.0 * cm, load_y, cx - 0.62 * cm, load_y, force_color)
+                    self._placed_label(
+                        c, f"Fh {load.value:.2f} kN", pad, load_y + 0.18 * cm,
+                        force_color, label_rects, min_y=base_y + 1.0 * cm, max_y=top_y - 0.15 * cm,
+                        leader_to=(cx - 1.1 * cm, load_y),
+                    )
+        elif data.horizontal_force_kn > 0:
+            if data.horizontal_force_direction < 0:
+                self._arrow(c, cx + 2.0 * cm, force_y, cx + 0.62 * cm, force_y, force_color)
+                self._placed_label(c, f"Fh {data.horizontal_force_kn:.2f} kN",
+                                   right_force_lane_x, force_y + 0.18 * cm, force_color, label_rects)
+            else:
+                self._arrow(c, cx - 2.0 * cm, force_y, cx - 0.62 * cm, force_y, force_color)
+                self._placed_label(c, f"Fh {data.horizontal_force_kn:.2f} kN",
+                                   pad, force_y + 0.18 * cm, force_color, label_rects)
+        vertical_loads = [
+            load for load in (self.assembly.point_loads if self.assembly else [])
+            if load.direction == "vertical" and load.value > 0
+        ]
+        if vertical_loads:
+            for load in vertical_loads:
+                load_y = self._y_for_height(load.height_m, data.height_m, top_y, base_y)
+                load_x = cx + max(-2.8 * cm, min(2.8 * cm, load.x_m * x_scale))
+                self._arrow(c, load_x, load_y + 0.78 * cm, load_x, load_y + 0.22 * cm,
+                            HexColor("#B8872B"))
+                load_label = f"{load.value:.0f} kg"
+                if abs(load.x_m) > 0.01:
+                    load_label += f" / e {load.x_m:.2f} m"
+                label_x = pad if load.x_m <= 0 else min(right_force_lane_x, load_x + 0.18 * cm)
+                self._placed_label(
+                    c, load_label, label_x, load_y + 0.88 * cm, HexColor("#B8872B"),
+                    label_rects, min_y=base_y + 1.0 * cm, max_y=top_y + 0.75 * cm,
+                    leader_to=(load_x, load_y + 0.78 * cm),
+                )
+        elif data.payload_kg > 0:
+            self._arrow(c, payload_x, top_y + 0.95 * cm, payload_x, top_y + 0.38 * cm,
+                        HexColor("#B8872B"))
+            self._placed_label(c, f"{data.payload_kg:.0f} kg", payload_x + 0.08 * cm,
+                               top_y + 0.95 * cm, HexColor("#B8872B"), label_rects)
+        direction = -1 if getattr(result, "moment_direction", 1) < 0 else 1
+        edge_x = cx - foundation_w / 2 - 0.62 * cm if direction > 0 else cx + foundation_w / 2 + 1.18 * cm
+        fk_dx = -1.08 * cm if direction > 0 else 0.08 * cm
         self._arrow(c, edge_x, base_y + 0.18 * cm,
-                    edge_x, base_y + 0.78 * cm,
-                    status_color, f"Fk {result.edge_force_kn * 1000.0:.0f} N",
-                    label_dx=-1.08 * cm, label_dy=0.03 * cm)
-        self._arrow(c, cx + foundation_w / 2 + 0.58 * cm, base_y + 0.68 * cm,
-                    cx + foundation_w / 2 + 0.58 * cm, base_y + 0.12 * cm,
-                    status_color, f"Rz {result.base_compression_kg * 9.80665 / 1000.0:.2f} kN",
-                    label_dx=-1.05 * cm, label_dy=0.05 * cm)
+                    edge_x, base_y + 0.78 * cm, status_color)
+        self._placed_label(
+            c, f"Fk {result.edge_force_kn * 1000.0:.0f} N",
+            edge_x + fk_dx, base_y + 0.88 * cm, status_color, label_rects,
+            min_y=base_y + 0.35 * cm, max_y=base_y + 1.8 * cm,
+        )
+        rz_x = cx + foundation_w / 2 + 0.56 * cm
+        self._arrow(c, rz_x, base_y + 1.32 * cm,
+                    rz_x, base_y + 0.78 * cm, status_color)
+        self._placed_label(
+            c, f"Rz {result.base_compression_kg * 9.80665 / 1000.0:.2f} kN",
+            right_force_lane_x, base_y + 1.42 * cm, status_color, label_rects,
+            min_y=base_y + 0.6 * cm, max_y=base_y + 2.15 * cm,
+        )
 
         if data.foundation.type == "concrete_socket":
             c.setStrokeColor(status_color)
@@ -1860,24 +2045,23 @@ class _TowerSchemaFlowable(Flowable):
             c.setFont("Helvetica", 8)
             c.drawString(cx + 0.95 * cm, base_y + 0.48 * cm, f"T {result.bolt_tension_kn:.2f} kN")
 
-        self._dimension(c, cx + foundation_w / 2 + 0.5 * cm, top_y,
-                        cx + foundation_w / 2 + 0.5 * cm, base_y,
-                        f"H {data.height_m:.2f} m", vertical=True)
+        self._dimension(c, right_dimension_x, top_y, right_dimension_x, base_y, "", vertical=True)
+        self._placed_label(c, f"H {data.height_m:.2f} m", right_dimension_x + 0.12 * cm,
+                           (top_y + base_y) / 2, TEXT_MUTED, label_rects)
         self._dimension(c, cx - foundation_w / 2, 0.22 * cm,
                         cx + foundation_w / 2, 0.22 * cm,
                         f"B {data.foundation.width_m:.2f} m", vertical=False)
-        self._dimension(c, cx + 0.65 * cm, force_y, cx + 0.65 * cm, base_y,
-                        f"hF {data.force_height_m:.2f} m", vertical=True)
-        if abs(data.payload_eccentricity_m) > 0.01:
-            self._dimension(c, cx, top_y + 0.72 * cm, payload_x, top_y + 0.72 * cm,
-                            f"e {data.payload_eccentricity_m:.2f} m", vertical=False)
+        if data.horizontal_force_kn > 0:
+            self._dimension(c, hforce_dimension_x, force_y, hforce_dimension_x, base_y, "", vertical=True)
+            self._placed_label(c, f"hF {data.force_height_m:.2f} m", hforce_dimension_x + 0.12 * cm,
+                               (force_y + base_y) / 2, TEXT_MUTED, label_rects)
 
         c.setFillColor(TEXT_DARK)
         c.setFont("Helvetica-Bold", 9)
         c.drawString(0.55 * cm, h - 0.65 * cm, f"MEd {result.design_moment_knm:.2f} kNm")
         c.drawString(0.55 * cm, h - 1.05 * cm, f"Kopfversatz {result.total_top_displacement_mm:.1f} mm")
 
-        bend = min(1.0 * cm, max(0.15 * cm, result.total_top_displacement_mm / 50.0 * cm))
+        bend = direction * min(1.0 * cm, max(0.15 * cm, result.total_top_displacement_mm / 50.0 * cm))
         if result.total_top_displacement_mm > 0:
             c.setStrokeColor(status_color)
             c.setLineWidth(1.4)
@@ -1890,13 +2074,43 @@ class _TowerSchemaFlowable(Flowable):
             c.drawPath(path, stroke=1, fill=0)
             c.setDash()
 
+    def _draw_ui_canvas_image(self, c, w: float, h: float) -> bool:
+        if self.assembly is None:
+            return False
+        try:
+            from trusscalc.ui.panels.tower_panel import render_tower_schema_png_bytes
+            pixel_w = 820
+            pixel_h = max(480, int(pixel_w * h / max(w, 1)))
+            png_bytes = render_tower_schema_png_bytes(
+                self.assembly,
+                self.result,
+                self.truss_type,
+                width_px=pixel_w,
+                height_px=pixel_h,
+                render_scale=2,
+            )
+        except Exception:
+            return False
+        inset = 0.14 * cm
+        c.drawImage(
+            ImageReader(BytesIO(png_bytes)),
+            inset,
+            inset,
+            width=w - 2 * inset,
+            height=h - 2 * inset,
+            preserveAspectRatio=True,
+            anchor="c",
+            mask="auto",
+        )
+        return True
+
     def _y_for_height(self, value: float, height_m: float, top_y: float, base_y: float) -> float:
         if height_m <= 0:
             return base_y
         ratio = max(0.0, min(1.0, value / height_m))
         return base_y + ratio * (top_y - base_y)
 
-    def _arrow(self, c, x1, y1, x2, y2, color, label, label_dx=0, label_dy=0.1 * cm):
+    def _arrow(self, c, x1, y1, x2, y2, color, label=None, label_dx=0, label_dy=0.1 * cm):
         c.setStrokeColor(color)
         c.setFillColor(color)
         c.setLineWidth(1.4)
@@ -1915,8 +2129,109 @@ class _TowerSchemaFlowable(Flowable):
         head.lineTo(p3[0], p3[1])
         head.close()
         c.drawPath(head, stroke=0, fill=1)
-        c.setFont("Helvetica", 8)
-        c.drawString(min(x1, x2) + label_dx, max(y1, y2) + label_dy, label)
+        if label:
+            c.setFont("Helvetica", 8)
+            c.drawString(min(x1, x2) + label_dx, max(y1, y2) + label_dy, label)
+
+    def _placed_label(
+        self,
+        c,
+        text: str,
+        x: float,
+        y: float,
+        color,
+        occupied: list[tuple[float, float, float, float]],
+        min_y: float | None = None,
+        max_y: float | None = None,
+        leader_to: tuple[float, float] | None = None,
+        font_size: float = 7.5,
+    ) -> tuple[float, float, float, float]:
+        c.setFont("Helvetica", font_size)
+        width = c.stringWidth(text, "Helvetica", font_size)
+        height = font_size + 2
+        max_x = max(0.55 * cm, self.width - width - 0.55 * cm)
+        x = min(max(x, 0.55 * cm), max_x)
+        min_y = 0.4 * cm if min_y is None else min_y
+        max_y = self.height - 0.35 * cm if max_y is None else max_y
+        y = min(max(y, min_y), max_y)
+
+        step = height + 2
+        candidates = [y]
+        for idx in range(1, 18):
+            candidates.extend([y - step * idx, y + step * idx])
+        best_y = y
+        for candidate in candidates:
+            if candidate < min_y or candidate > max_y:
+                continue
+            rect = (x - 2, candidate - 2, width + 4, height + 4)
+            if not any(_rects_intersect(rect, other) for other in occupied):
+                best_y = candidate
+                break
+
+        rect = (x - 2, best_y - 2, width + 4, height + 4)
+        occupied.append(rect)
+        if leader_to:
+            c.setStrokeColor(color)
+            c.setLineWidth(0.35)
+            c.line(leader_to[0], leader_to[1], x, best_y + 2)
+        c.setFillColor(color)
+        c.setFont("Helvetica", font_size)
+        c.drawString(x, best_y, text)
+        return rect
+
+    def _draw_horizontal_truss(self, c, x1, x2, y):
+        left, right = min(x1, x2), max(x1, x2)
+        half = 0.16 * cm
+        c.setStrokeColor(TEXT_DARK)
+        c.setLineWidth(2.0)
+        c.line(left, y - half, right, y - half)
+        c.line(left, y + half, right, y + half)
+        c.setStrokeColor(TEXT_MUTED)
+        c.setLineWidth(0.55)
+        step = 0.48 * cm
+        x = left
+        flip = False
+        while x + step <= right:
+            if flip:
+                c.line(x, y + half, x + step, y - half)
+            else:
+                c.line(x, y - half, x + step, y + half)
+            c.line(x, y - half, x, y + half)
+            x += step
+            flip = not flip
+        c.line(right, y - half, right, y + half)
+
+    def _draw_cantilever_deflections(self, c, specs, x_scale, color, occupied):
+        if not self.assembly or not specs:
+            return
+        deflections = cantilever_deflections_mm(self.assembly, self.truss_type, self.data.gamma)
+        if not deflections:
+            return
+        c.setStrokeColor(color)
+        c.setFillColor(color)
+        c.setLineWidth(1.1)
+        c.setDash(4, 3)
+        for cantilever, x1, x2, y in specs:
+            value_mm = deflections.get(cantilever.id or "", 0.0)
+            if value_mm <= 0.05:
+                continue
+            sag = min(0.75 * cm, max(0.09 * cm, value_mm / 20.0 * cm))
+            mid_x = (x1 + x2) / 2.0
+            path = c.beginPath()
+            path.moveTo(x1, y)
+            path.curveTo(mid_x, y - sag * 0.15, mid_x, y - sag * 0.75, x2, y - sag)
+            c.drawPath(path, stroke=1, fill=0)
+            c.setDash()
+            c.setFont("Helvetica", 7.5)
+            label_x = min(x1, x2) + 0.12 * cm if cantilever.side == "left" else max(x1, x2) - 0.92 * cm
+            label_y = y - sag - 0.34 * cm
+            self._placed_label(
+                c, f"u {value_mm:.1f} mm", label_x, label_y, color, occupied,
+                min_y=0.75 * cm, max_y=self.height - 0.45 * cm,
+                leader_to=(x2, y - sag),
+            )
+            c.setDash(4, 3)
+        c.setDash()
 
     def _dimension(self, c, x1, y1, x2, y2, label, vertical: bool):
         c.setStrokeColor(TEXT_LIGHT)
@@ -1930,6 +2245,12 @@ class _TowerSchemaFlowable(Flowable):
             c.drawString(x1 + 0.12 * cm, (y1 + y2) / 2, label)
         else:
             c.drawCentredString((x1 + x2) / 2, y1 + 0.08 * cm, label)
+
+
+def _rects_intersect(a, b) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
 
 
 def _key_value_table(rows: list[list[str]], styles: dict) -> Table:
@@ -1973,7 +2294,12 @@ def _kg_or_inf(value: float) -> str:
     return f"{value:.1f} kg"
 
 
-def _build_project_closing_pdf(path: str, chapters: list[dict], metadata) -> None:
+def _build_project_closing_pdf(
+    path: str,
+    chapters: list[dict],
+    metadata,
+    numbered_footer: bool = True,
+) -> None:
     lang = metadata.language
     styles = _styles(lang)
     doc = BaseDocTemplate(
@@ -2005,9 +2331,12 @@ def _build_project_closing_pdf(path: str, chapters: list[dict], metadata) -> Non
         Spacer(1, 0.5 * cm),
         _signature_block(lang, styles),
     ]
-    footer = _make_footer_drawer(metadata, lang)
-    doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
-        *a, footer_drawer=footer, **kw))
+    if numbered_footer:
+        footer = _make_footer_drawer(metadata, lang)
+        doc.build(story, canvasmaker=lambda *a, **kw: _NumberedCanvas(
+            *a, footer_drawer=footer, **kw))
+    else:
+        doc.build(story)
 
 
 def _notice_box(lang: str, styles: dict) -> Flowable:

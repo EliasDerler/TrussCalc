@@ -59,15 +59,20 @@ Key dataclasses: `TrussType`, `LoadTableEntry`, `TrussSection`, `Support`, `Poin
 
 `ProjectBundle` is the current multi-tab project container. Each `Project` inside `ProjectBundle.subprojects` is one Sub-Projekt. A Sub-Projekt can contain multiple independent `TrussSystem` entries; each system has its own truss type, geometry, loads, and calculation result. `Project.view_mode` is `"plan"` or `"compare"`: Planen shows `plan_system_id` only, Vergleichen shows `compare_system_ids` and allows visual X/Y system placement. Switching Planen→Vergleichen copies the plan system into the comparison set; switching back can keep the existing plan system or import a copied comparison system. Treat the active tab as a sub-project editor and the active system as the editing target; do not reintroduce global single-project assumptions in UI, persistence, or PDF code.
 
+Tower tabs are `Project.kind == "tower"`. Tower V3 stores the editable drawing in `Project.tower_assembly` (`TowerAssembly`: one foundation snapshot, vertical `TowerAssemblySection` stack, horizontal `TowerAssemblyCantilever` arms, and horizontal/vertical `TowerAssemblyLoad` point forces with `x_m` positions). `core/tower_assembly.py` adapts this drawing to the existing `TowerInput` for `core/tower_calculator.py` and PDF export. Keep this adapter boundary intact: calculator/PDF can continue consuming `TowerInput`, while the UI/persistence source of truth is `tower_assembly`.
+
 ### Database (`database/db_manager.py`)
 
 SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCALC_DB` env var. On first `init_db()`, if the DB is empty, `seed_default_truss_types_if_empty()` loads `trusscalc/resources/default_truss_types.json` (195 entries, 5 truss types). The `_resources_path()` helper resolves to either the dev-tree or `sys._MEIPASS` in a PyInstaller bundle.
+
+Tower foundations live in SQLite table `tower_foundations` and are manually maintained through the left library panel. There are intentionally no default foundation entries. When a foundation is placed in a Tower tab, the project stores a snapshot (`tower_assembly.foundation` + connector data), so old projects remain reproducible even if the DB library entry later changes.
 
 ### UI (`ui/`)
 
 - **`main_window.py`**: LTSpice-style layout — library panel (left), `QTabWidget` + `TrussCanvas` (center), properties panel (right). Calculation is triggered via F5 / toolbar button and belongs only to the active Sub-Projekt. `_generate_pdf()` exports all calculated Sub-Projekte through `pdf_generator.generate_project_report()`; `generate_report()` remains the public single-report compatibility API. The PDF metadata dialog asks for project-level metadata only; Sub-Projekt names come from the tab names.
 - **`canvas/truss_canvas.py`**: `QGraphicsView` with tool states (`CanvasTool` enum). Click handlers emit signals that open dialogs.
 - **`canvas/canvas_items.py`**: `QGraphicsItem` subclasses for truss sections, supports, loads. Colors come from `core/color_rules.py` after calculation.
+- **`panels/tower_panel.py`**: Tower V3 editor. Users place one foundation from the Fundamentbibliothek, append vertical truss sections, add horizontal Auskragungen left/right, place horizontal/vertical point forces, then press F5. Middle mouse pans, mouse wheel zooms. F5 validates the drawing, asks only remaining calculation data, builds `TowerInput`, and calls the existing tower calculator. V3 calculation supports only one truss type across vertical tower and all arms; block mixed truss types with a clear user message. Auskragungen are a Vorbemessungs input: their self-weight and vertical point loads become equivalent eccentric payload moments, and their local cantilever deflection is estimated separately from datasheet EI. Horizontalkräfte store their clicked side in `TowerAssemblyLoad.x_m`; left-side forces push to the right, right-side forces push to the left, and the adapter combines them into a signed horizontal moment. This is still not a full 2D frame/FEM proof. Auskragung heights describe the top edge of the horizontal truss, not its centerline.
 
 ### PDF Report (`pdf/`)
 
@@ -77,8 +82,9 @@ SQLite via stdlib. DB path: `~/TrussCalc/trusscalc.db`, overridable via `TRUSSCA
 
 ### Project Persistence
 
-- `.tcproj` files are format version `3` and contain `data.subprojects[].systems[]`.
+- `.tcproj` files are format version `6` and contain `data.subprojects[].systems[]` for beam tabs plus `data.subprojects[].tower_assembly` for Tower tabs.
 - Legacy files without `subprojects` or without `systems` are automatically migrated by `load_project_from_file()`.
+- Legacy v4 form-based Tower tabs are migrated by `assembly_from_tower_input()` into one foundation snapshot, one vertical section, and equivalent point loads.
 - Always call `_commit_active_subproject_state()` before saving, exporting PDF, or switching away from the active tab.
 - `save_project()` / `load_project()` in `database/db_manager.py` use the same JSON structure as `.tcproj`.
 

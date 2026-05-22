@@ -62,10 +62,14 @@ class PdfImportDialog(QDialog):
             self._weight.setValue(md["weight_per_meter_kg"])
 
         notes = list(result.warnings or [])
-        notes.append(f"KI-Parser hat {len(result.entries)} Einträge erkannt – "
-                     "bitte prüfen.")
+        notes.append(
+            f"KI-Parser hat {len(result.entries)} Einträge erkannt - "
+            "bitte alle Werte vor dem Speichern prüfen."
+        )
         self._warnings_label.setText("\n".join(notes))
-        self._warnings_label.setStyleSheet("color: #66DD66;")
+        self._warnings_label.setStyleSheet(
+            "color: orange;" if result.warnings else "color: #66DD66;"
+        )
 
         self._table.setRowCount(0)
         for entry in result.entries:

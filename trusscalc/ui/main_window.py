@@ -21,9 +21,11 @@ from PyQt6.QtGui import QAction, QKeySequence, QIcon
 from trusscalc.core.models import (
     Project, ProjectBundle, TrussSystem, TrussType, TrussSection, Support,
     PointLoad, DistributedLoad, UnitSystem, CalculationResult, TowerInput,
+    TowerAssembly, TowerFoundationPreset,
 )
 from trusscalc.core import calculator
 from trusscalc.core import tower_calculator
+from trusscalc.core.tower_assembly import assembly_from_tower_input, tower_input_from_assembly
 from trusscalc.core.interpolator import LoadTableInterpolator
 from trusscalc.ui.canvas.truss_canvas import TrussCanvas
 from trusscalc.ui.canvas.canvas_tools import CanvasTool
@@ -60,6 +62,7 @@ class MainWindow(QMainWindow):
         self._pdf_worker = None
         self._copy_templates: list = []
         self._tower_cache_key = "__tower__"
+        self._selected_tower_foundation: Optional[TowerFoundationPreset] = None
         self._setup_ui()
         self._apply_dark_theme()
         self._new_project()
@@ -110,7 +113,7 @@ class MainWindow(QMainWindow):
 
         # Ansicht
         view_menu = mb.addMenu("&Ansicht")
-        view_menu.addAction(self._action("Gewaehltes System zentrieren", self._fit_view))
+        view_menu.addAction(self._action("Gewähltes System zentrieren", self._fit_view))
         view_menu.addAction(self._action("Alle Systeme zentrieren", self._fit_all_view, "Ctrl+Space"))
 
     def _setup_toolbar(self) -> None:
@@ -141,8 +144,35 @@ class MainWindow(QMainWindow):
             tb.addAction(act)
 
         tb.addSeparator()
-        tb.addAction(self._action("Kopieren", self._copy_selected))
-        tb.addAction(self._action("Spiegeln", self._mirror_selected))
+        def tower_action(label: str, tool: str, shortcut: str = "") -> QAction:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            if shortcut:
+                act.setShortcut(shortcut)
+            act.triggered.connect(lambda checked, t=tool: self._set_tower_tool(t))
+            return act
+
+        self._act_tower_select = tower_action("Auswahl", "select")
+        self._act_tower_foundation = tower_action("Fundament", "foundation", "F")
+        self._act_tower_section = tower_action("Traverse", "section", "T")
+        self._act_tower_cantilever = tower_action("Auskragung", "cantilever", "A")
+        self._act_tower_horizontal = tower_action("Horizontalkraft", "horizontal", "H")
+        self._act_tower_vertical = tower_action("Punktlast", "vertical", "P")
+        self._act_tower_delete = tower_action("Löschen", "delete")
+        self._tower_tool_actions = [
+            self._act_tower_select, self._act_tower_foundation,
+            self._act_tower_section, self._act_tower_cantilever,
+            self._act_tower_horizontal,
+            self._act_tower_vertical, self._act_tower_delete,
+        ]
+        for act in self._tower_tool_actions:
+            tb.addAction(act)
+
+        self._act_copy = self._action("Kopieren", self._copy_selected)
+        self._act_mirror = self._action("Spiegeln", self._mirror_selected)
+        self._beam_only_actions = self._tool_actions + [self._act_copy, self._act_mirror]
+        tb.addAction(self._act_copy)
+        tb.addAction(self._act_mirror)
         tb.addSeparator()
         tb.addAction(self._action("▶▶ Berechnen [F5]", self._run_calculation))
         tb.addAction(self._action("✕ Reset", self._clear_all_results_in_tab))
@@ -162,12 +192,17 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._mode_combo)
 
         self._act_select.setChecked(True)
+        self._act_tower_select.setChecked(True)
+        for act in self._tower_tool_actions:
+            act.setVisible(False)
 
     def _setup_central(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self._library = TrussLibraryPanel()
         self._library.truss_double_clicked.connect(self._use_truss_type)
+        self._library.foundation_selected.connect(self._remember_tower_foundation)
+        self._library.foundation_double_clicked.connect(self._use_tower_foundation)
         self._library._btn_pdf.clicked.connect(self._import_pdf)
         self._library._btn_pdf_ai.clicked.connect(self._import_pdf_ai)
         self._library._btn_manual.clicked.connect(self._add_manual_truss)
@@ -195,6 +230,9 @@ class MainWindow(QMainWindow):
         self._tower_panel = TowerPanel()
         self._tower_panel.changed.connect(self._on_tower_changed)
         self._tower_panel.calculate_requested.connect(self._run_calculation)
+        self._tower_panel.foundation_place_requested.connect(self._place_selected_tower_foundation)
+        self._tower_panel.element_selected.connect(self._on_tower_element_selected)
+        self._tower_panel.element_delete_requested.connect(self._on_element_deleted)
 
         self._props = PropertiesPanel()
         self._props.edit_requested.connect(self._on_edit_element)
@@ -295,6 +333,30 @@ class MainWindow(QMainWindow):
             CanvasTool.ADD_DIST_LOAD: "Klick auf Canvas: Streckenlast setzen",
         }[tool])
 
+    def _set_tower_tool(self, tool: str) -> None:
+        for act in self._tower_tool_actions:
+            act.setChecked(False)
+        mapping = {
+            "select": self._act_tower_select,
+            "foundation": self._act_tower_foundation,
+            "section": self._act_tower_section,
+            "cantilever": self._act_tower_cantilever,
+            "horizontal": self._act_tower_horizontal,
+            "vertical": self._act_tower_vertical,
+            "delete": self._act_tower_delete,
+        }
+        mapping.get(tool, self._act_tower_select).setChecked(True)
+        self._tower_panel.set_tool(tool)
+        self._status.showMessage({
+            "select": "Tower-Auswahl aktiv",
+            "foundation": "Fundament-Werkzeug aktiv",
+            "section": "Klick in die Tower-Ansicht: Traversenabschnitt anfügen",
+            "cantilever": "Links oder rechts vom Tower klicken: Auskragung einfügen",
+            "horizontal": "Klick in die Tower-Ansicht: Horizontalkraft setzen",
+            "vertical": "Klick in die Tower-Ansicht: Punktlast setzen",
+            "delete": "Klick in die Tower-Ansicht: Element löschen",
+        }.get(tool, "Tower-Werkzeug aktiv"))
+
     def _create_empty_subproject(self, name: str = "Sub-Projekt 1") -> Project:
         unit = self._unit_combo.currentData() if hasattr(self, "_unit_combo") else UnitSystem.KG_M
         system = self._create_empty_system("System 1", 0)
@@ -317,7 +379,8 @@ class MainWindow(QMainWindow):
             truss_type_id=0,
             unit_system=unit,
             kind="tower",
-            tower_input=TowerInput(),
+            tower_input=TowerInput(height_m=0.0, horizontal_force_kn=0.0, force_height_m=0.0),
+            tower_assembly=TowerAssembly(),
             tower_result=None,
             systems=[],
             compare_system_ids=[],
@@ -339,6 +402,8 @@ class MainWindow(QMainWindow):
         if self._is_tower_project(project):
             if project.tower_input is None:
                 project.tower_input = TowerInput(truss_type_id=project.truss_type_id)
+            if project.tower_assembly is None:
+                project.tower_assembly = assembly_from_tower_input(project.tower_input)
             project.truss_type_id = project.tower_input.truss_type_id
             return
         if not project.systems:
@@ -419,6 +484,12 @@ class MainWindow(QMainWindow):
         if not project:
             return
         if self._is_tower_project(project):
+            if project.tower_assembly is None:
+                project.tower_assembly = assembly_from_tower_input(project.tower_input)
+            if project.tower_assembly:
+                data, errors = tower_input_from_assembly(project.tower_assembly, self._truss_for_tower(project))
+                if not errors:
+                    project.tower_input = data
             if project.tower_input:
                 project.truss_type_id = project.tower_input.truss_type_id
             return
@@ -473,16 +544,21 @@ class MainWindow(QMainWindow):
     def _truss_for_tower(self, project: Optional[Project] = None,
                          idx: Optional[int] = None) -> Optional[TrussType]:
         project = project or self._project
-        if not project or not project.tower_input or not project.tower_input.truss_type_id:
+        truss_id = 0
+        if project and project.tower_input:
+            truss_id = project.tower_input.truss_type_id
+        if project and project.tower_assembly and project.tower_assembly.truss_type_ids:
+            truss_id = project.tower_assembly.truss_type_ids[0]
+        if not project or not truss_id:
             return None
         cache_idx = self._active_subproject_index if idx is None else idx
         if 0 <= cache_idx < len(self._subproject_truss_types):
             cache = self._subproject_truss_types[cache_idx]
             cached = cache.get(self._tower_cache_key)
-            if cached and cached.id == project.tower_input.truss_type_id:
+            if cached and cached.id == truss_id:
                 return cached
         from trusscalc.database.db_manager import load_truss_type
-        truss = load_truss_type(project.tower_input.truss_type_id)
+        truss = load_truss_type(truss_id)
         if truss and 0 <= cache_idx < len(self._subproject_truss_types):
             self._subproject_truss_types[cache_idx][self._tower_cache_key] = truss
         return truss
@@ -570,13 +646,20 @@ class MainWindow(QMainWindow):
         if self._is_tower_project():
             if self._project.tower_input is None:
                 self._project.tower_input = TowerInput()
+            if self._project.tower_assembly is None:
+                self._project.tower_assembly = assembly_from_tower_input(self._project.tower_input)
             truss = self._truss_for_tower()
             self._truss_type = truss
-            self._tower_panel.set_tower(self._project.tower_input, self._project.tower_result, truss)
-            self._props.show_project_summary(None, None)
+            self._tower_panel.set_tower(
+                self._project.tower_input,
+                self._project.tower_result,
+                truss,
+                self._project.tower_assembly,
+            )
+            self._props.show_tower_summary(self._project.tower_assembly, truss)
             self._lbl_truss.setText(
                 f"Tower: {self._project.name} | "
-                + (f"Traversentyp: {truss.display_name}" if truss else "Kein Traversentyp ausgewaehlt")
+                + (f"Traversentyp: {truss.display_name}" if truss else "Kein Traversentyp ausgewählt")
             )
             return
         system = self._active_system()
@@ -616,6 +699,7 @@ class MainWindow(QMainWindow):
         idx = self._active_subproject_index
         if 0 <= idx < len(self._project_bundle.subprojects):
             if self._is_tower_project():
+                self._project.tower_assembly = self._tower_panel.tower_assembly()
                 self._project.tower_input = self._tower_panel.tower_input()
                 if self._truss_type:
                     self._subproject_truss_types[idx][self._tower_cache_key] = self._truss_type
@@ -818,13 +902,21 @@ class MainWindow(QMainWindow):
         if self._is_tower_project():
             self._system_bar.setVisible(False)
             self._mode_combo.setEnabled(False)
-            for act in self._tool_actions:
+            for act in self._beam_only_actions:
+                act.setVisible(False)
                 act.setEnabled(False)
+            for act in self._tower_tool_actions:
+                act.setVisible(True)
+                act.setEnabled(True)
             self._canvas.set_comparison_mode(False)
             return
         self._mode_combo.setEnabled(True)
-        for act in self._tool_actions:
+        for act in self._beam_only_actions:
+            act.setVisible(True)
             act.setEnabled(True)
+        for act in self._tower_tool_actions:
+            act.setVisible(False)
+            act.setEnabled(False)
         mode = self._project.view_mode or "plan"
         idx = self._mode_combo.findData(mode)
         self._mode_combo.blockSignals(True)
@@ -944,6 +1036,7 @@ class MainWindow(QMainWindow):
     def _on_tower_changed(self) -> None:
         if not self._is_tower_project():
             return
+        self._project.tower_assembly = self._tower_panel.tower_assembly()
         self._project.tower_input = self._tower_panel.tower_input()
         self._project.truss_type_id = self._project.tower_input.truss_type_id
         self._project.tower_result = None
@@ -951,7 +1044,7 @@ class MainWindow(QMainWindow):
         self._commit_active_subproject_state()
         self._lbl_truss.setText(
             f"Tower: {self._project.name} | "
-            + (f"Traversentyp: {self._truss_type.display_name}" if self._truss_type else "Kein Traversentyp ausgewaehlt")
+            + (f"Traversentyp: {self._truss_type.display_name}" if self._truss_type else "Kein Traversentyp ausgewählt")
         )
 
     def _add_system(self) -> None:
@@ -1112,26 +1205,24 @@ class MainWindow(QMainWindow):
         if self._is_tower_project():
             if self._project.tower_input is None:
                 self._project.tower_input = TowerInput()
+            if self._project.tower_assembly is None:
+                self._project.tower_assembly = assembly_from_tower_input(self._project.tower_input)
             if not truss.has_weight:
                 QMessageBox.warning(
                     self, "Eigengewicht unbekannt",
                     f"Der Traversentyp '{truss.name}' hat kein Eigengewicht im Datenblatt.\n"
-                    "Das Eigengewicht wird in der Tower-Berechnung nicht beruecksichtigt.",
+                    "Das Eigengewicht wird in der Tower-Berechnung nicht berücksichtigt.",
                 )
-            old_id = self._project.tower_input.truss_type_id
-            if old_id != truss.id:
-                self._push_undo()
-                self._project.tower_input.truss_type_id = truss.id or 0
-                self._project.truss_type_id = truss.id or 0
-                self._project.tower_result = None
             self._truss_type = truss
             self._subproject_truss_types[self._active_subproject_index][self._tower_cache_key] = truss
-            self._tower_panel.set_tower(self._project.tower_input, self._project.tower_result, truss)
+            self._tower_panel.set_truss_type(truss)
+            self._project.tower_assembly = self._tower_panel.tower_assembly()
+            self._project.tower_result = None
             self._commit_active_subproject_state()
             self._refresh_active_system_ui()
             self._refresh_tabs()
             self._status.showMessage(
-                f"Traversentyp '{truss.display_name}' fuer Tower '{self._project.name}' ausgewaehlt"
+                f"Traversentyp '{truss.display_name}' für neue Tower-Abschnitte ausgewählt"
             )
             return
         self._ensure_project_systems(self._project)
@@ -1181,6 +1272,41 @@ class MainWindow(QMainWindow):
         self._status.showMessage(
             f"Traversentyp '{truss.display_name}' für System '{system.name}' ausgewählt"
         )
+
+    def _use_tower_foundation(self, foundation: TowerFoundationPreset) -> None:
+        self._selected_tower_foundation = foundation
+        if not self._project_bundle:
+            self._new_project()
+        if not self._is_tower_project():
+            QMessageBox.information(
+                self,
+                "Fundament",
+                "Fundamente können nur in einem Tower-Tab platziert werden.",
+            )
+            return
+        if self._project.tower_assembly is None:
+            self._project.tower_assembly = assembly_from_tower_input(self._project.tower_input)
+        self._push_undo()
+        self._tower_panel.set_foundation(foundation)
+        self._project.tower_assembly = self._tower_panel.tower_assembly()
+        self._project.tower_result = None
+        self._commit_active_subproject_state()
+        self._refresh_active_system_ui()
+        self._status.showMessage(f"Fundament '{foundation.name}' platziert")
+
+    def _remember_tower_foundation(self, foundation: TowerFoundationPreset) -> None:
+        self._selected_tower_foundation = foundation
+        self._status.showMessage(f"Fundament ausgewählt: {foundation.name}")
+
+    def _place_selected_tower_foundation(self) -> None:
+        if not self._selected_tower_foundation:
+            QMessageBox.information(
+                self,
+                "Fundament",
+                "Bitte zuerst ein Fundament in der Fundamentbibliothek auswaehlen.",
+            )
+            return
+        self._use_tower_foundation(self._selected_tower_foundation)
 
     def _open_project(self) -> None:
         from trusscalc.database.db_manager import load_project_from_file
@@ -1296,14 +1422,14 @@ class MainWindow(QMainWindow):
         messages = []
         if result.program_update_available:
             messages.append(
-                f"Neue TrussCalc-Version verfuegbar: {result.latest_version} "
+                f"Neue TrussCalc-Version verfügbar: {result.latest_version} "
                 f"(installiert: {APP_VERSION})"
             )
         if result.new_default_trusses:
             shown = ", ".join(result.new_default_trusses[:6])
             if len(result.new_default_trusses) > 6:
                 shown += f" und {len(result.new_default_trusses) - 6} weitere"
-            messages.append(f"Neue Default-Traversen in der Bibliothek verfuegbar: {shown}")
+            messages.append(f"Neue Default-Traversen in der Bibliothek verfügbar: {shown}")
         if not messages:
             self._status.showMessage(
                 "TrussCalc ist aktuell; Default-Bibliothek geprueft.",
@@ -1313,7 +1439,7 @@ class MainWindow(QMainWindow):
         detail = "\n".join(messages)
         if result.release_url:
             detail += f"\n\nDownload: {result.release_url}"
-        QMessageBox.information(self, "Update verfuegbar", detail)
+        QMessageBox.information(self, "Update verfügbar", detail)
 
     def _reset_canvas(self) -> None:
         if not self._project or self._is_tower_project():
@@ -1408,8 +1534,29 @@ class MainWindow(QMainWindow):
         else:
             self._props.show_element(element)
 
+    def _on_tower_element_selected(self, element) -> None:
+        if element is None:
+            self._props.show_tower_summary(
+                self._project.tower_assembly if self._project else None,
+                self._truss_type,
+            )
+        else:
+            self._props.show_element(element)
+
     def _on_element_deleted(self, element) -> None:
         if not self._project:
+            return
+        if element is None:
+            return
+        if isinstance(element, dict) and element.get("tower_kind"):
+            if not self._is_tower_project():
+                return
+            self._push_undo()
+            self._tower_panel.delete_selection_ref(element)
+            self._project.tower_assembly = self._tower_panel.tower_assembly()
+            self._project.tower_result = None
+            self._commit_active_subproject_state()
+            self._props.show_tower_summary(self._project.tower_assembly, self._truss_type)
             return
         system = self._active_system()
         if not system:
@@ -1430,6 +1577,16 @@ class MainWindow(QMainWindow):
 
     def _on_edit_element(self, element) -> None:
         if not element:
+            return
+        if isinstance(element, dict) and element.get("tower_kind"):
+            if not self._is_tower_project():
+                return
+            self._push_undo()
+            self._tower_panel.edit_selection_ref(element)
+            self._project.tower_assembly = self._tower_panel.tower_assembly()
+            self._project.tower_result = None
+            self._commit_active_subproject_state()
+            self._props.show_tower_summary(self._project.tower_assembly, self._truss_type)
             return
         if isinstance(element, Support):
             dlg = SupportDialog(support=element, parent=self)
@@ -1560,7 +1717,14 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"{len(clones)} Objekt(e) kopiert und gespiegelt")
 
     def _delete_selected(self) -> None:
-        if not self._project or self._is_tower_project():
+        if not self._project:
+            return
+        if self._is_tower_project():
+            selected = self._tower_panel.selected_element()
+            if not selected:
+                return
+            self._on_element_deleted(selected)
+            self._status.showMessage("Tower-Objekt gelöscht")
             return
         system = self._active_system()
         if not system:
@@ -1580,7 +1744,7 @@ class MainWindow(QMainWindow):
         self._clear_results()
         self._canvas.load_project(self._project)
         self._props.show_project_summary(self._project, self._truss_type)
-        self._status.showMessage(f"{len(ids)} Objekt(e) geloescht")
+        self._status.showMessage(f"{len(ids)} Objekt(e) gelöscht")
 
     def _clones_at_anchor(self, templates: list, anchor_m: float) -> list:
         if not templates:
@@ -1663,7 +1827,7 @@ class MainWindow(QMainWindow):
         self._refresh_active_system_ui()
         self._update_window_title()
         self._mark_dirty()
-        self._status.showMessage("Letzte Aenderung rueckgaengig gemacht")
+        self._status.showMessage("Letzte Änderung rückgängig gemacht")
 
     def _redo(self) -> None:
         if not self._redo_stack:
@@ -1684,7 +1848,7 @@ class MainWindow(QMainWindow):
         self._refresh_active_system_ui()
         self._update_window_title()
         self._mark_dirty()
-        self._status.showMessage("Aenderung wiederholt")
+        self._status.showMessage("Änderung wiederholt")
 
     def _push_undo(self) -> None:
         if not self._project:
@@ -1700,9 +1864,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Berechnung", "Bitte zuerst ein Projekt einrichten.")
             return
         if self._is_tower_project():
-            self._project.tower_input = self._tower_panel.tower_input()
+            self._project.tower_assembly = self._tower_panel.tower_assembly()
             truss = self._truss_for_tower()
-            result = tower_calculator.calculate_tower(self._project.tower_input, truss)
+            tower_input, errors = self._tower_panel.validated_tower_input(self, ask_settings=True, truss_type=truss)
+            if errors:
+                if errors != ["Berechnung abgebrochen."]:
+                    QMessageBox.warning(self, "Tower-Berechnung", "\n".join(errors))
+                return
+            self._project.tower_input = tower_input
+            self._project.truss_type_id = tower_input.truss_type_id
+            result = tower_calculator.calculate_tower(tower_input, truss)
             self._project.tower_result = result
             self._truss_type = truss
             self._tower_panel.show_result(result)
@@ -1726,7 +1897,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        progress = QProgressDialog("Berechnung laeuft ...", None, 0, 0, self)
+        progress = QProgressDialog("Berechnung läuft ...", None, 0, 0, self)
         progress.setWindowTitle("Simulation")
         progress.setWindowModality(Qt.WindowModality.ApplicationModal)
         progress.setCancelButton(None)
@@ -1765,27 +1936,39 @@ class MainWindow(QMainWindow):
 
     def _clear_results(self) -> None:
         if self._is_tower_project():
+            had_result = self._project.tower_result is not None
             self._project.tower_result = None
             self._tower_panel.show_result(None)
             self._commit_active_subproject_state()
+            if had_result:
+                self._mark_dirty()
             return
         system = self._active_system()
+        had_result = bool(system and system.id in self._system_results())
         self._clear_system_result(system.id if system else None)
         self._commit_active_subproject_state()
+        if had_result:
+            self._mark_dirty()
 
     def _clear_all_results_in_tab(self) -> None:
         if self._is_tower_project():
+            had_result = self._project.tower_result is not None
             self._project.tower_result = None
             self._tower_panel.show_result(None)
             self._commit_active_subproject_state()
-            self._status.showMessage("Tower-Ergebnis geloescht")
+            if had_result:
+                self._mark_dirty()
+            self._status.showMessage("Tower-Ergebnis gelöscht")
             return
+        had_results = bool(self._system_results()) or self._last_result is not None
         self._last_result = None
         self._system_results().clear()
         self._canvas.clear_results()
         self._show_all_results()
         self._commit_active_subproject_state()
-        self._status.showMessage("Alle Ergebnisse im aktuellen Tab geloescht")
+        if had_results:
+            self._mark_dirty()
+        self._status.showMessage("Alle Ergebnisse im aktuellen Tab gelöscht")
 
     def _fit_view(self) -> None:
         if self._is_tower_project():
@@ -2056,11 +2239,19 @@ class MainWindow(QMainWindow):
             if self._is_tower_project(project):
                 if project.tower_input is None:
                     project.tower_input = TowerInput()
+                if project.tower_assembly is None:
+                    project.tower_assembly = assembly_from_tower_input(project.tower_input)
                 truss_type = self._truss_for_tower(project, idx)
+                tower_input, tower_errors = tower_input_from_assembly(project.tower_assembly, truss_type)
+                if tower_errors:
+                    missing.append(project.name or f"Tower {idx + 1}")
+                    continue
+                project.tower_input = tower_input
+                project.truss_type_id = tower_input.truss_type_id
                 result = project.tower_result
                 if result is None:
                     try:
-                        result = tower_calculator.calculate_tower(project.tower_input, truss_type)
+                        result = tower_calculator.calculate_tower(tower_input, truss_type)
                         project.tower_result = result
                     except Exception:
                         result = None
@@ -2070,7 +2261,8 @@ class MainWindow(QMainWindow):
                         "project": copy.deepcopy(project),
                         "truss_type": copy.deepcopy(truss_type) if truss_type else None,
                         "result": copy.deepcopy(result),
-                        "tower_input": copy.deepcopy(project.tower_input),
+                        "tower_input": copy.deepcopy(tower_input),
+                        "tower_assembly": copy.deepcopy(project.tower_assembly),
                         "sub_project_name": project.name,
                         "system_name": "",
                         "view_mode": "tower",
@@ -2183,6 +2375,7 @@ class MainWindow(QMainWindow):
                 "truss_type": copy.deepcopy(truss_type) if truss_type else None,
                 "result": copy.deepcopy(chapter["result"]),
                 "tower_input": copy.deepcopy(chapter.get("tower_input")),
+                "tower_assembly": copy.deepcopy(chapter.get("tower_assembly")),
                 "datasheet_pdf_bytes": datasheet,
                 "sub_project_name": chapter.get("sub_project_name", ""),
                 "system_name": chapter.get("system_name", ""),
@@ -2367,7 +2560,10 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         if mods == Qt.KeyboardModifier.NoModifier and key == Qt.Key.Key_Escape:
-            if self._canvas.is_copy_mode_active():
+            if self._is_tower_project():
+                self._set_tower_tool("select")
+                self._status.showMessage("Tower-Werkzeug beendet")
+            elif self._canvas.is_copy_mode_active():
                 self._canvas.cancel_copy_mode()
                 self._status.showMessage("Kopieren abgebrochen")
             else:
